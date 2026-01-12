@@ -74,19 +74,20 @@ app = FastAPI(
 # CORS
 # ======================================================
 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://orange-glacier-025d6730f.2.azurestaticapps.net",
+        "https://logmarket.azurewebsites.net",
         "http://localhost:5500",
-        "http://127.0.0.1:5500",
-        "https://logmarket.azurewebsites.net"
-        "https://orange-glacier-025d6730f.2.azurestaticapps.net"
-
+        "http://127.0.0.1:5500"
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ======================================================
 # DATABASE
@@ -2301,4 +2302,5 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
