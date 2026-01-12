@@ -825,7 +825,7 @@ def ml_callback(code: str, state: str):
     cn.close()
 
     # Ajuste para sua rota real do front
-    return RedirectResponse(url="https://logmarket.azurewebsites.net/frontend/integracoes.html")
+    return RedirectResponse(url="https://orange-glacier-025d6730f.2.azurestaticapps.net/integracoes.html")
 
 
 # ---------- Token válido (refresh automático) ----------
@@ -2284,6 +2284,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
