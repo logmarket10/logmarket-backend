@@ -688,33 +688,42 @@ def bootstrap_user(data: CreateUserIn):
 # =========================
 
 def extract_ml_sku_and_tipo(it: dict):
+    """
+    Extrai corretamente:
+    - SKU (seller_custom_field) a partir das VARIAÇÕES
+    - Tipo de anúncio (CATALOGO | LISTA)
+
+    Regras:
+    - SKU SEMPRE vem de variations[].seller_custom_field
+    - Tipo catálogo é definido exclusivamente por catalog_product_id
+    """
+
     seller_sku = None
 
-    # seller_custom_field
-    seller_sku = it.get("seller_custom_field")
+    # ============================
+    # 1️⃣ SKU — SEMPRE NAS VARIAÇÕES
+    # ============================
+    variations = it.get("variations") or []
 
-    # attributes
+    for v in variations:
+        sku = v.get("seller_custom_field")
+        if sku:
+            seller_sku = sku.strip()
+            break
+
+    # ============================
+    # 2️⃣ FALLBACK (RARO)
+    # ============================
     if not seller_sku:
-        for a in it.get("attributes", []):
+        for a in it.get("attributes", []) or []:
             if a.get("id") == "SELLER_SKU":
-                seller_sku = a.get("value_name")
+                seller_sku = (a.get("value_name") or "").strip()
                 break
 
-    # variations
-    if not seller_sku:
-        for v in it.get("variations", []):
-            seller_sku = v.get("seller_custom_field")
-            if seller_sku:
-                break
-
-    seller_sku = seller_sku.strip() if seller_sku else None
-
-    # 🔥 DETECÇÃO CORRETA DE CATÁLOGO
-    is_catalogo = (
-        bool(it.get("catalog_product_id")) or
-        it.get("listing_type_id") == "gold_special" and it.get("catalog_listing")
-    )
-
+    # ============================
+    # 3️⃣ TIPO DE ANÚNCIO (REGRA CORRETA)
+    # ============================
+    is_catalogo = bool(it.get("catalog_product_id"))
     tipo_anuncio = "CATALOGO" if is_catalogo else "LISTA"
 
     return seller_sku, is_catalogo, tipo_anuncio
@@ -1604,43 +1613,58 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
         cn = db()
         cur = cn.cursor()
 
-        # Limpa cache anterior da empresa
+        # ============================
+        # LIMPA CACHE ANTERIOR
+        # ============================
         cur.execute("""
             DELETE FROM dbo.ml_anuncios_cache
             WHERE empresa_id = ?;
         """, empresa_id)
 
-        # 🔁 LOOP CORRETO
+        # ============================
+        # PROCESSA ANÚNCIOS
+        # ============================
         for it in items:
             seller_sku, is_catalogo, tipo_anuncio = extract_ml_sku_and_tipo(it)
 
-            cur.execute("""
-                    INSERT INTO dbo.ml_anuncios_cache (
-                        empresa_id,
-                        ml_item_id,
-                        titulo,
-                        seller_sku,
-                        is_catalogo,
-                        tipo_anuncio,
-                        status,
-                        status_raw,
-                        preco,
-                        estoque_ml,
-                        atualizado_em
-                    )
-                    VALUES (?,?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
-                """,
-                empresa_id,
-                it.get("id"),
-                it.get("title"),
-                seller_sku,
-                int(is_catalogo),
-                tipo_anuncio,
-                status_pt(it.get("status")),
-                it.get("status"),
-                it.get("price"),
-                it.get("available_quantity")
+            # 🔍 LOG DEFENSIVO — SKU AUSENTE
+            if not seller_sku:
+                log(
+                    "WARN",
+                    "Anúncio sem seller_sku",
+                    ml_item_id=it.get("id"),
+                    titulo=it.get("title"),
+                    tem_variacoes=bool(it.get("variations")),
+                    catalog_product_id=it.get("catalog_product_id")
                 )
+
+            cur.execute("""
+                INSERT INTO dbo.ml_anuncios_cache (
+                    empresa_id,
+                    ml_item_id,
+                    titulo,
+                    seller_sku,
+                    is_catalogo,
+                    tipo_anuncio,
+                    status,
+                    status_raw,
+                    preco,
+                    estoque_ml,
+                    atualizado_em
+                )
+                VALUES (?,?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
+            """,
+            empresa_id,
+            it.get("id"),
+            it.get("title"),
+            seller_sku,
+            int(is_catalogo),
+            tipo_anuncio,
+            status_pt(it.get("status")),
+            it.get("status"),
+            it.get("price"),
+            it.get("available_quantity")
+            )
 
         cn.commit()
         cn.close()
@@ -2430,6 +2454,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
