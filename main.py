@@ -724,6 +724,19 @@ def extract_ml_sku_and_tipo(it: dict):
 
     return seller_sku, is_catalogo, tipo_anuncio
 
+# =========================
+# BUSCAR FULL MERCADO LIVRE
+# =========================
+
+def extract_ml_logistica(item: dict) -> dict:
+    shipping = item.get("shipping") or {}
+    logistic_type = shipping.get("logistic_type")
+
+    return {
+        "logistic_type": logistic_type,
+        "is_full": logistic_type == "fulfillment"
+    }
+
 
 
 def auto_vincular_sku_por_seller_sku(
@@ -1595,6 +1608,9 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
     job_set_processing(job_id)
 
     try:
+        # ============================
+        # IDENTIDADE ML
+        # ============================
         me = ml_me(empresa_id)
         user_id = me["id"]
 
@@ -1621,7 +1637,11 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
         # PROCESSA ANÚNCIOS
         # ============================
         for it in items:
+            # -------- SKU / TIPO --------
             seller_sku, is_catalogo, tipo_anuncio = extract_ml_sku_and_tipo(it)
+
+            # -------- FULL / LOGÍSTICA --------
+            logistic_type, is_full = extract_ml_logistica(it)
 
             # 🔍 LOG DEFENSIVO — SKU AUSENTE
             if not seller_sku:
@@ -1631,9 +1651,13 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
                     ml_item_id=it.get("id"),
                     titulo=it.get("title"),
                     tem_variacoes=bool(it.get("variations")),
-                    catalog_product_id=it.get("catalog_product_id")
+                    catalog_product_id=it.get("catalog_product_id"),
+                    logistic_type=logistic_type
                 )
 
+            # ============================
+            # INSERT CACHE
+            # ============================
             cur.execute("""
                 INSERT INTO dbo.ml_anuncios_cache (
                     empresa_id,
@@ -1646,25 +1670,32 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
                     status_raw,
                     preco,
                     estoque_ml,
+                    logistic_type,
+                    is_full,
                     atualizado_em
                 )
-                VALUES (?,?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
             """,
-            empresa_id,
-            it.get("id"),
-            it.get("title"),
-            seller_sku,
-            int(is_catalogo),
-            tipo_anuncio,
-            status_pt(it.get("status")),
-            it.get("status"),
-            it.get("price"),
-            it.get("available_quantity")
+                empresa_id,
+                it.get("id"),
+                it.get("title"),
+                seller_sku,
+                int(is_catalogo),
+                tipo_anuncio,
+                status_pt(it.get("status")),
+                it.get("status"),
+                it.get("price"),
+                it.get("available_quantity"),
+                logistic_type,
+                1 if is_full else 0
             )
 
         cn.commit()
         cn.close()
 
+        # ============================
+        # JOB OK
+        # ============================
         job_set_success(job_id, {
             "ml_user_id": user_id,
             "total_anuncios": len(items),
@@ -1673,7 +1704,6 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
 
     except Exception as e:
         job_set_error(job_id, str(e))
-
 
 
 # ============================
@@ -2450,6 +2480,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
