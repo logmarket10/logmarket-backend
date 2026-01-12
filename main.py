@@ -285,32 +285,6 @@ def login_user(data: LoginIn):
     }
 
    
-    # =========================
-    # TOKEN
-    # =========================
-    token_payload = {
-        "sub": str(row[0]),
-        "email": row[2],
-        "nome": row[1],
-        "perfil": perfil
-    }
-
-    if empresa_id is not None:
-        token_payload["empresa_id"] = int(empresa_id)
-
-    token = create_token(token_payload)
-
-    return {
-        "access_token": token,
-        "user": {
-            "id": int(row[0]),
-            "nome": row[1],
-            "email": row[2],
-            "perfil": perfil,
-            "empresa_id": int(empresa_id) if empresa_id is not None else None
-        }
-    }
-
 # =========================
 # SUPER ADMIN EMPRESAS
 # =========================
@@ -709,6 +683,90 @@ def bootstrap_user(data: CreateUserIn):
     cn.close()
     return {"ok": True}
 
+# =========================
+# HELPER MERCADO LIVRE
+# =========================
+
+def extract_ml_sku_and_tipo(item: dict) -> tuple[str | None, bool, str]:
+    """
+    Retorna:
+    - seller_sku (quando existir)
+    - is_catalogo (bool)
+    - tipo_anuncio (CATALOGO | LISTA)
+    """
+
+    # SKU pode vir em diferentes lugares
+    seller_sku = None
+
+    # Caso mais comum
+    if item.get("seller_custom_field"):
+        seller_sku = item["seller_custom_field"].strip()
+
+    # Fallback: variações
+    elif item.get("variations"):
+        for v in item["variations"]:
+            if v.get("seller_custom_field"):
+                seller_sku = v["seller_custom_field"].strip()
+                break
+
+    # Tipo do anúncio
+    is_catalogo = bool(item.get("catalog_listing"))
+    tipo_anuncio = "CATALOGO" if is_catalogo else "LISTA"
+
+    return seller_sku, is_catalogo, tipo_anuncio
+
+
+def auto_vincular_sku_por_seller_sku(
+    cur,
+    empresa_id: int,
+    sku_id: int,
+    sku_codigo: str
+) -> tuple[int, list[str]]:
+    """
+    Vincula automaticamente anúncios do ML ao SKU
+    usando seller_sku = sku.codigo
+
+    Retorna:
+    - quantidade de vínculos criados
+    - lista de ml_item_id vinculados
+    """
+
+    cur.execute("""
+        SELECT ml_item_id
+        FROM dbo.ml_anuncios_cache
+        WHERE empresa_id = ?
+          AND seller_sku = ?
+    """, empresa_id, sku_codigo)
+
+    itens = [r.ml_item_id for r in cur.fetchall()]
+
+    vinculados = 0
+    vinculados_ids = []
+
+    for ml_item_id in itens:
+        # não sobrescreve vínculo existente (manual ou auto)
+        cur.execute("""
+            SELECT 1
+            FROM dbo.sku_anuncios
+            WHERE ml_item_id = ?
+        """, ml_item_id)
+
+        if cur.fetchone():
+            continue
+
+        cur.execute("""
+            INSERT INTO dbo.sku_anuncios (
+                sku_id,
+                ml_item_id,
+                origem_vinculo
+            )
+            VALUES (?, ?, 'AUTO')
+        """, sku_id, ml_item_id)
+
+        vinculados += 1
+        vinculados_ids.append(ml_item_id)
+
+    return vinculados, vinculados_ids
 
 # =========================
 # INTEGRAÇÕES — MERCADO LIVRE (OAuth + Refresh)
@@ -1107,7 +1165,7 @@ def list_skus(payload=Depends(require_auth)):
 
 @app.post("/sku")
 def create_sku(data: SkuCreateIn, payload=Depends(require_auth)):
-    empresa_id = int(payload["empresa_id"])  # ESSENCIAL (SaaS)
+    empresa_id = int(payload["empresa_id"])
 
     codigo = (data.codigo or "").strip()
     nome = (data.nome or "").strip()
@@ -1127,22 +1185,27 @@ def create_sku(data: SkuCreateIn, payload=Depends(require_auth)):
     cur = cn.cursor()
 
     try:
-        # Verifica se já existe SKU com mesmo código na empresa
-        cur.execute(
-            "SELECT id, ativo FROM dbo.sku WHERE codigo = ? AND empresa_id = ?",
-            codigo, empresa_id
-        )
+        # 🔍 Verifica SKU existente
+        cur.execute("""
+            SELECT id, ativo
+            FROM dbo.sku
+            WHERE codigo = ?
+              AND empresa_id = ?
+        """, codigo, empresa_id)
+
         row = cur.fetchone()
 
+        # ==========================================
+        # 🔁 SKU EXISTE
+        # ==========================================
         if row:
             sku_id = int(row.id)
             ativo = int(row.ativo)
 
-            # SKU já existe e está ativo
             if ativo == 1:
                 raise HTTPException(status_code=400, detail="SKU já existe (ativo).")
 
-            # SKU existe mas estava inativo → reativa
+            # 🔄 Reativar SKU
             cur.execute("""
                 UPDATE dbo.sku
                 SET nome = ?,
@@ -1160,17 +1223,35 @@ def create_sku(data: SkuCreateIn, payload=Depends(require_auth)):
                 empresa_id
             )
 
+            # 🔗 vínculo automático
+            auto_vinculados, auto_vinculados_ids = auto_vincular_sku_por_seller_sku(
+                  cur,
+                  empresa_id,
+                  sku_id,
+                  codigo
+              )
+
             cn.commit()
 
             log(
                 "CREATE",
                 f"SKU reativado com estoque {estoque_central}",
-                sku_id=sku_id
+                sku_id=sku_id,
+                auto_vinculados=auto_vinculados
             )
 
-            return {"ok": True, "reativado": True, "id": sku_id}
+            return {
+              "ok": True,
+              "reativado": True,
+              "sku_id": sku_id,
+              "auto_vinculados": auto_vinculados,
+              "auto_vinculos": auto_vinculados_ids
+          }
 
-        # Novo SKU
+
+        # ==========================================
+        # ➕ NOVO SKU
+        # ==========================================
         cur.execute("""
             INSERT INTO dbo.sku (
                 codigo,
@@ -1181,6 +1262,7 @@ def create_sku(data: SkuCreateIn, payload=Depends(require_auth)):
                 empresa_id,
                 atualizado_em
             )
+            OUTPUT INSERTED.id
             VALUES (?,?,?,?,1,?,SYSUTCDATETIME())
         """,
             codigo,
@@ -1190,15 +1272,35 @@ def create_sku(data: SkuCreateIn, payload=Depends(require_auth)):
             empresa_id
         )
 
+        sku_id = int(cur.fetchone()[0])
+
+        # 🔗 vínculo automático
+        auto_vinculados, auto_vinculados_ids = auto_vincular_sku_por_seller_sku(
+              cur,
+              empresa_id,
+              sku_id,
+              codigo
+          )
+
+
         cn.commit()
 
         log(
             "CREATE",
             f"SKU criado com estoque {estoque_central}",
-            sku_id=None
+            sku_id=sku_id,
+            auto_vinculados=auto_vinculados
         )
 
-        return {"ok": True, "reativado": False}
+        return {
+            "ok": True,
+            "reativado": False,
+            "sku_id": sku_id,
+            "auto_vinculados": auto_vinculados,
+            "auto_vinculos": auto_vinculados_ids
+        }
+
+
 
     except HTTPException:
         cn.rollback()
@@ -1350,17 +1452,25 @@ def vincular_anuncio(sku_id: int, data: LinkItemIn, payload=Depends(require_auth
         if row:
             cur.execute("""
                 UPDATE dbo.sku_anuncios
-                SET sku_id = ?, variacao_id = ?
-                WHERE ml_item_id = ?
+                  SET
+                      sku_id = ?,
+                      variacao_id = ?,
+                      origem_vinculo = 'MANUAL'
+                  WHERE ml_item_id = ?
             """, sku_id, variacao_id, ml_item_id)
             cn.commit()
             log("AJUSTE", f"Vínculo atualizado: {ml_item_id} -> sku_id={sku_id}", sku_id=sku_id, ml_item_id=ml_item_id)
             return {"ok": True, "updated": True}
 
         cur.execute("""
-            INSERT INTO dbo.sku_anuncios (sku_id, ml_item_id, variacao_id)
-            VALUES (?,?,?)
-        """, sku_id, ml_item_id, variacao_id)
+            INSERT INTO dbo.sku_anuncios (
+                  sku_id,
+                  ml_item_id,
+                  variacao_id,
+                  origem_vinculo
+              )
+              VALUES (?, ?, ?, 'MANUAL')
+        """, sku_id, ml_item_id, variacao_id, )
 
         cn.commit()
         log("AJUSTE", f"Vinculado anúncio {ml_item_id}", sku_id=sku_id, ml_item_id=ml_item_id)
@@ -1495,22 +1605,32 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
             WHERE empresa_id = ?;
         """, empresa_id)
 
+        # 🔁 LOOP CORRETO
         for it in items:
+            seller_sku, is_catalogo, tipo_anuncio = extract_ml_sku_and_tipo(it)
+
             cur.execute("""
                 INSERT INTO dbo.ml_anuncios_cache (
                     empresa_id,
                     ml_item_id,
                     titulo,
+                    seller_sku,
+                    is_catalogo,
+                    tipo_anuncio,
                     status,
                     status_raw,
                     preco,
                     estoque_ml,
                     atualizado_em
-                ) VALUES (?,?,?,?,?,?,?,SYSUTCDATETIME())
+                )
+                VALUES (?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
             """,
             empresa_id,
             it.get("id"),
             it.get("title"),
+            seller_sku,
+            int(is_catalogo),
+            tipo_anuncio,
             status_pt(it.get("status")),
             it.get("status"),
             it.get("price"),
@@ -1544,14 +1664,21 @@ def ml_anuncios(payload=Depends(require_auth)):
     # Cache de anúncios
     cur.execute("""
         SELECT
-            ml_item_id,
-            titulo,
-            status,
-            status_raw,
-            preco,
-            estoque_ml
-        FROM dbo.ml_anuncios_cache
-        WHERE empresa_id = ?
+            mac.ml_item_id,
+            mac.titulo,
+            mac.seller_sku,
+            mac.tipo_anuncio,
+            mac.is_catalogo,
+            mac.status,
+            mac.status_raw,
+            mac.preco,
+            mac.estoque_ml,
+            sa.origem_vinculo
+        FROM dbo.ml_anuncios_cache mac
+        LEFT JOIN dbo.sku_anuncios sa
+          ON sa.ml_item_id = mac.ml_item_id
+        AND sa.sku_id IS NOT NULL
+        WHERE mac.empresa_id = ?
         ORDER BY titulo;
     """, empresa_id)
 
@@ -1581,9 +1708,12 @@ def ml_anuncios(payload=Depends(require_auth)):
 
     out = []
     for a in anuncios:
-        out.append({
+              out.append({
             "ml_item_id": a.ml_item_id,
             "titulo": a.titulo,
+            "seller_sku": a.seller_sku,
+            "tipo_anuncio": a.tipo_anuncio,
+            "is_catalogo": bool(a.is_catalogo),
             "status": a.status,
             "status_raw": a.status_raw,
             "estoque_ml": a.estoque_ml,
@@ -1613,27 +1743,38 @@ def ml_anuncios_sync(payload=Depends(require_auth)):
         cn = db()
         cur = cn.cursor()
 
+        # Limpa cache anterior
         cur.execute(
             "DELETE FROM dbo.ml_anuncios_cache WHERE empresa_id = ?",
             empresa_id
         )
 
+        # 🔁 LOOP CORRETO
         for it in items:
+            seller_sku, is_catalogo, tipo_anuncio = extract_ml_sku_and_tipo(it)
+
             cur.execute("""
                 INSERT INTO dbo.ml_anuncios_cache (
                     empresa_id,
                     ml_item_id,
                     titulo,
+                    seller_sku,
+                    is_catalogo,
+                    tipo_anuncio,
                     status,
                     status_raw,
                     preco,
                     estoque_ml,
                     atualizado_em
-                ) VALUES (?,?,?,?,?,?,?,SYSUTCDATETIME())
+                )
+                VALUES (?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
             """,
             empresa_id,
             it.get("id"),
             it.get("title"),
+            seller_sku,
+            int(is_catalogo),
+            tipo_anuncio,
             status_pt(it.get("status")),
             it.get("status"),
             it.get("price"),
@@ -2284,7 +2425,6 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
-
 
 
 
