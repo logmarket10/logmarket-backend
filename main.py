@@ -689,39 +689,35 @@ def bootstrap_user(data: CreateUserIn):
 
 def extract_ml_sku_and_tipo(it: dict):
     """
-    Extrai corretamente:
-    - SKU (seller_custom_field) a partir das VARIAÇÕES
-    - Tipo de anúncio (CATALOGO | LISTA)
-
-    Regras:
-    - SKU SEMPRE vem de variations[].seller_custom_field
-    - Tipo catálogo é definido exclusivamente por catalog_product_id
+    Extrai SKU e tipo de anúncio do Mercado Livre considerando:
+    - Anúncios com variação
+    - Anúncios de catálogo sem variação (SKU em attributes)
     """
 
     seller_sku = None
 
     # ============================
-    # 1️⃣ SKU — SEMPRE NAS VARIAÇÕES
+    # 1️⃣ SKU NAS VARIAÇÕES (PRIORIDADE)
     # ============================
-    variations = it.get("variations") or []
-
-    for v in variations:
+    for v in it.get("variations", []) or []:
         sku = v.get("seller_custom_field")
         if sku:
             seller_sku = sku.strip()
             break
 
     # ============================
-    # 2️⃣ FALLBACK (RARO)
+    # 2️⃣ SKU EM ATTRIBUTES (CATÁLOGO SEM VARIAÇÃO)
     # ============================
     if not seller_sku:
         for a in it.get("attributes", []) or []:
             if a.get("id") == "SELLER_SKU":
-                seller_sku = (a.get("value_name") or "").strip()
-                break
+                val = a.get("value_name")
+                if val:
+                    seller_sku = val.strip()
+                    break
 
     # ============================
-    # 3️⃣ TIPO DE ANÚNCIO (REGRA CORRETA)
+    # 3️⃣ TIPO DE ANÚNCIO
     # ============================
     is_catalogo = bool(it.get("catalog_product_id"))
     tipo_anuncio = "CATALOGO" if is_catalogo else "LISTA"
@@ -2454,6 +2450,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
