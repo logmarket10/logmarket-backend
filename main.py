@@ -1792,7 +1792,7 @@ def ml_anuncios_sync(payload=Depends(require_auth)):
                     estoque_ml,
                     atualizado_em
                 )
-                VALUES (?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
+                VALUES (?,?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
             """,
             empresa_id,
             it.get("id"),
@@ -2450,6 +2450,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
