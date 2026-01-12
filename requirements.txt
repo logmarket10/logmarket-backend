@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+gunicorn
+python-dotenv
+requests
+pyodbc
+bcrypt
+python-jose
+python-multipart
+python-jose[cryptography]
+
+
+
+
+
+
