@@ -687,30 +687,37 @@ def bootstrap_user(data: CreateUserIn):
 # HELPER MERCADO LIVRE
 # =========================
 
-def extract_ml_sku_and_tipo(item: dict) -> tuple[str | None, bool, str]:
+def extract_ml_sku_and_tipo(it: dict):
     """
-    Retorna:
-    - seller_sku (quando existir)
-    - is_catalogo (bool)
+    Extrai:
+    - seller_sku
+    - is_catalogo
     - tipo_anuncio (CATALOGO | LISTA)
     """
 
-    # SKU pode vir em diferentes lugares
     seller_sku = None
 
-    # Caso mais comum
-    if item.get("seller_custom_field"):
-        seller_sku = item["seller_custom_field"].strip()
+    # 1️⃣ seller_custom_field direto
+    seller_sku = it.get("seller_custom_field")
 
-    # Fallback: variações
-    elif item.get("variations"):
-        for v in item["variations"]:
-            if v.get("seller_custom_field"):
-                seller_sku = v["seller_custom_field"].strip()
+    # 2️⃣ attributes → SELLER_SKU
+    if not seller_sku:
+        for a in it.get("attributes", []):
+            if a.get("id") == "SELLER_SKU":
+                seller_sku = a.get("value_name")
                 break
 
+    # 3️⃣ variations
+    if not seller_sku:
+        for v in it.get("variations", []):
+            seller_sku = v.get("seller_custom_field")
+            if seller_sku:
+                break
+
+    seller_sku = seller_sku.strip() if seller_sku else None
+
     # Tipo do anúncio
-    is_catalogo = bool(item.get("catalog_listing"))
+    is_catalogo = bool(it.get("catalog_product_id"))
     tipo_anuncio = "CATALOGO" if is_catalogo else "LISTA"
 
     return seller_sku, is_catalogo, tipo_anuncio
@@ -2425,6 +2432,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
