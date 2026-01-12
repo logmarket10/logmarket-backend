@@ -688,26 +688,19 @@ def bootstrap_user(data: CreateUserIn):
 # =========================
 
 def extract_ml_sku_and_tipo(it: dict):
-    """
-    Extrai:
-    - seller_sku
-    - is_catalogo
-    - tipo_anuncio (CATALOGO | LISTA)
-    """
-
     seller_sku = None
 
-    # 1️⃣ seller_custom_field direto
+    # seller_custom_field
     seller_sku = it.get("seller_custom_field")
 
-    # 2️⃣ attributes → SELLER_SKU
+    # attributes
     if not seller_sku:
         for a in it.get("attributes", []):
             if a.get("id") == "SELLER_SKU":
                 seller_sku = a.get("value_name")
                 break
 
-    # 3️⃣ variations
+    # variations
     if not seller_sku:
         for v in it.get("variations", []):
             seller_sku = v.get("seller_custom_field")
@@ -716,11 +709,16 @@ def extract_ml_sku_and_tipo(it: dict):
 
     seller_sku = seller_sku.strip() if seller_sku else None
 
-    # Tipo do anúncio
-    is_catalogo = bool(it.get("catalog_product_id"))
+    # 🔥 DETECÇÃO CORRETA DE CATÁLOGO
+    is_catalogo = (
+        bool(it.get("catalog_product_id")) or
+        it.get("listing_type_id") == "gold_special" and it.get("catalog_listing")
+    )
+
     tipo_anuncio = "CATALOGO" if is_catalogo else "LISTA"
 
     return seller_sku, is_catalogo, tipo_anuncio
+
 
 
 def auto_vincular_sku_por_seller_sku(
@@ -1617,32 +1615,32 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
             seller_sku, is_catalogo, tipo_anuncio = extract_ml_sku_and_tipo(it)
 
             cur.execute("""
-                INSERT INTO dbo.ml_anuncios_cache (
-                    empresa_id,
-                    ml_item_id,
-                    titulo,
-                    seller_sku,
-                    is_catalogo,
-                    tipo_anuncio,
-                    status,
-                    status_raw,
-                    preco,
-                    estoque_ml,
-                    atualizado_em
+                    INSERT INTO dbo.ml_anuncios_cache (
+                        empresa_id,
+                        ml_item_id,
+                        titulo,
+                        seller_sku,
+                        is_catalogo,
+                        tipo_anuncio,
+                        status,
+                        status_raw,
+                        preco,
+                        estoque_ml,
+                        atualizado_em
+                    )
+                    VALUES (?,?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
+                """,
+                empresa_id,
+                it.get("id"),
+                it.get("title"),
+                seller_sku,
+                int(is_catalogo),
+                tipo_anuncio,
+                status_pt(it.get("status")),
+                it.get("status"),
+                it.get("price"),
+                it.get("available_quantity")
                 )
-                VALUES (?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
-            """,
-            empresa_id,
-            it.get("id"),
-            it.get("title"),
-            seller_sku,
-            int(is_catalogo),
-            tipo_anuncio,
-            status_pt(it.get("status")),
-            it.get("status"),
-            it.get("price"),
-            it.get("available_quantity")
-            )
 
         cn.commit()
         cn.close()
@@ -2432,6 +2430,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
