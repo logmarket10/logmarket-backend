@@ -178,9 +178,13 @@ def require_auth(credentials: HTTPAuthorizationCredentials = Security(security))
 
 def require_admin(credentials: HTTPAuthorizationCredentials = Security(security)):
     payload = verify_token(credentials.credentials)
-    if payload.get("perfil") != "admin":
-        raise HTTPException(status_code=403, detail="Acesso restrito a administradores.")
+    if payload.get("perfil") not in ("admin", "super_admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Acesso restrito a administradores."
+        )
     return payload
+
 
 def require_super_admin(credentials: HTTPAuthorizationCredentials = Security(security)):
     payload = verify_token(credentials.credentials)
@@ -2280,6 +2284,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
