@@ -280,27 +280,7 @@ def login_user(data: LoginIn):
         }
     }
 
-    # =========================
-    # REGRAS DE NEGÓCIO
-    # =========================
-    perfil = (row[4] or "usuario").strip().lower()
-    empresa_id = row[6]
-    empresa_ativa = row[7]
-
-    # 🔐 somente super_admin pode não ter empresa
-    if perfil != "super_admin":
-        if empresa_id is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Usuário sem empresa vinculada."
-            )
-
-        if not bool(empresa_ativa):
-            raise HTTPException(
-                status_code=403,
-                detail="Empresa inativa. Entre em contato com o administrador do sistema."
-            )
-
+   
     # =========================
     # TOKEN
     # =========================
@@ -2300,6 +2280,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
