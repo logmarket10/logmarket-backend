@@ -80,6 +80,8 @@ app.add_middleware(
         "http://localhost:5500",
         "http://127.0.0.1:5500",
         "https://logmarket.azurewebsites.net"
+        "https://orange-glacier-025d6730f.2.azurestaticapps.net"
+
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -2299,3 +2301,4 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
