@@ -728,14 +728,12 @@ def extract_ml_sku_and_tipo(it: dict):
 # BUSCAR FULL MERCADO LIVRE
 # =========================
 
-def extract_ml_logistica(item: dict) -> dict:
+def extract_ml_logistica(item: dict):
     shipping = item.get("shipping") or {}
     logistic_type = shipping.get("logistic_type")
+    is_full = logistic_type == "fulfillment"
 
-    return {
-        "logistic_type": logistic_type,
-        "is_full": logistic_type == "fulfillment"
-    }
+    return logistic_type, is_full
 
 
 
@@ -1608,9 +1606,6 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
     job_set_processing(job_id)
 
     try:
-        # ============================
-        # IDENTIDADE ML
-        # ============================
         me = ml_me(empresa_id)
         user_id = me["id"]
 
@@ -1620,44 +1615,33 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
             limit=50
         )
 
-        items = ml_fetch_items_batch(item_ids, empresa_id=empresa_id)
+        base_items = ml_fetch_items_batch(item_ids, empresa_id=empresa_id)
 
         cn = db()
         cur = cn.cursor()
 
-        # ============================
-        # LIMPA CACHE ANTERIOR
-        # ============================
+        # LIMPA CACHE
         cur.execute("""
             DELETE FROM dbo.ml_anuncios_cache
             WHERE empresa_id = ?;
         """, empresa_id)
 
-        # ============================
-        # PROCESSA ANÚNCIOS
-        # ============================
-        for it in items:
-            # -------- SKU / TIPO --------
-            seller_sku, is_catalogo, tipo_anuncio = extract_ml_sku_and_tipo(it)
+        for it_base in base_items:
+            # 🔹 ITEM COMPLETO (NECESSÁRIO PARA FULL)
+            it = ml_get_item_full(it_base["id"], empresa_id)
 
-            # -------- FULL / LOGÍSTICA --------
+            seller_sku, is_catalogo, tipo_anuncio = extract_ml_sku_and_tipo(it)
             logistic_type, is_full = extract_ml_logistica(it)
 
-            # 🔍 LOG DEFENSIVO — SKU AUSENTE
             if not seller_sku:
                 log(
                     "WARN",
                     "Anúncio sem seller_sku",
                     ml_item_id=it.get("id"),
                     titulo=it.get("title"),
-                    tem_variacoes=bool(it.get("variations")),
-                    catalog_product_id=it.get("catalog_product_id"),
                     logistic_type=logistic_type
                 )
 
-            # ============================
-            # INSERT CACHE
-            # ============================
             cur.execute("""
                 INSERT INTO dbo.ml_anuncios_cache (
                     empresa_id,
@@ -1693,18 +1677,14 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
         cn.commit()
         cn.close()
 
-        # ============================
-        # JOB OK
-        # ============================
         job_set_success(job_id, {
             "ml_user_id": user_id,
-            "total_anuncios": len(items),
+            "total_anuncios": len(base_items),
             "sincronizado_em": utcnow_naive().isoformat()
         })
 
     except Exception as e:
         job_set_error(job_id, str(e))
-
 
 # ============================
 # LISTAR ANÚNCIOS DO ML
@@ -1716,7 +1696,9 @@ def ml_anuncios(payload=Depends(require_auth)):
     cn = db()
     cur = cn.cursor()
 
-    # Cache de anúncios
+    # ============================
+    # CACHE DE ANÚNCIOS (ML)
+    # ============================
     cur.execute("""
         SELECT
             mac.ml_item_id,
@@ -1728,18 +1710,22 @@ def ml_anuncios(payload=Depends(require_auth)):
             mac.status_raw,
             mac.preco,
             mac.estoque_ml,
+            mac.is_full,
+            mac.logistic_type,
             sa.origem_vinculo
         FROM dbo.ml_anuncios_cache mac
         LEFT JOIN dbo.sku_anuncios sa
           ON sa.ml_item_id = mac.ml_item_id
-        AND sa.sku_id IS NOT NULL
+         AND sa.sku_id IS NOT NULL
         WHERE mac.empresa_id = ?
-        ORDER BY titulo;
+        ORDER BY mac.titulo;
     """, empresa_id)
 
     anuncios = cur.fetchall()
 
-    # Vínculos SKU
+    # ============================
+    # VÍNCULOS SKU
+    # ============================
     cur.execute("""
         SELECT
             sa.ml_item_id,
@@ -1761,9 +1747,12 @@ def ml_anuncios(payload=Depends(require_auth)):
 
     cn.close()
 
+    # ============================
+    # SERIALIZAÇÃO FINAL
+    # ============================
     out = []
     for a in anuncios:
-              out.append({
+        out.append({
             "ml_item_id": a.ml_item_id,
             "titulo": a.titulo,
             "seller_sku": a.seller_sku,
@@ -1773,10 +1762,17 @@ def ml_anuncios(payload=Depends(require_auth)):
             "status_raw": a.status_raw,
             "estoque_ml": a.estoque_ml,
             "preco": a.preco,
+
+            # 🔥 NOVOS CAMPOS FULL
+            "is_full": bool(a.is_full),
+            "logistic_type": a.logistic_type,
+
+            # SKU VINCULADO
             "sku": vinc.get(str(a.ml_item_id))
         })
 
     return out
+
 
 
 @app.post("/ml/anuncios/sync")
@@ -2480,6 +2476,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
