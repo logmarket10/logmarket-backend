@@ -730,14 +730,17 @@ def extract_ml_sku_and_tipo(it: dict):
 
 def extract_ml_logistica(item: dict):
     """
-    Extrai informações logísticas do anúncio.
-    FULL = logistic_type == 'fulfillment'
+    Detecta se o anúncio é FULL (Mercado Envios FULL)
     """
-    shipping = item.get("shipping") or {}
-    logistic_type = shipping.get("logistic_type")
-    is_full = logistic_type == "fulfillment"
+    shipping = item.get("shipping")
 
-    return logistic_type, is_full
+    if not shipping:
+        return None, False
+
+    logistic_type = shipping.get("logistic_type")
+
+    return logistic_type, logistic_type == "fulfillment"
+ logistic_type, is_full
 
 
 
@@ -1668,6 +1671,14 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
             # FULL / LOGÍSTICA
             logistic_type, is_full = extract_ml_logistica(it)
 
+                if logistic_type is None:
+                    log(
+                        "WARN",
+                        "Campo shipping ausente no item ML",
+                        ml_item_id=it.get("id"),
+                        keys=list(it.keys())
+                    )
+
             # LOG DEFENSIVO
             if not seller_sku:
                 log(
@@ -2520,6 +2531,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
