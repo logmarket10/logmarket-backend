@@ -1620,65 +1620,35 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
     job_set_processing(job_id)
 
     try:
-        # ============================
-        # IDENTIDADE MERCADO LIVRE
-        # ============================
         me = ml_me(empresa_id)
         user_id = me["id"]
 
-        # ============================
-        # LISTA IDS
-        # ============================
+        # 1️⃣ LISTA IDs
         item_ids = ml_list_all_item_ids(
             user_id=user_id,
             empresa_id=empresa_id,
             limit=50
         )
 
-        # ============================
-        # FETCH BÁSICO
-        # ============================
+        # 2️⃣ FETCH BÁSICO (ids válidos)
         base_items = ml_fetch_items_batch(item_ids, empresa_id=empresa_id)
 
         cn = db()
         cur = cn.cursor()
 
-        # ============================
-        # LIMPA CACHE
-        # ============================
+        # 3️⃣ LIMPA CACHE
         cur.execute("""
             DELETE FROM dbo.ml_anuncios_cache
             WHERE empresa_id = ?;
         """, empresa_id)
 
-        # ============================
-        # PROCESSA ITENS
-        # ============================
+        # 4️⃣ PROCESSA UM A UM (ITEM COMPLETO)
         for it_base in base_items:
-            # 🔹 ITEM COMPLETO (necessário p/ shipping.logistic_type)
             it = ml_get_item_full(it_base["id"], empresa_id)
 
-            # -------- SKU / TIPO --------
             seller_sku, is_catalogo, tipo_anuncio = extract_ml_sku_and_tipo(it)
-
-            # -------- LOGÍSTICA / FULL --------
             logistic_type, is_full = extract_ml_logistica(it)
 
-
-
-            # 🔍 LOG DEFENSIVO
-            if not seller_sku:
-                log(
-                    "WARN",
-                    "Anúncio sem seller_sku",
-                    ml_item_id=it.get("id"),
-                    titulo=it.get("title"),
-                    logistic_type=logistic_type
-                )
-
-            # ============================
-            # INSERT CACHE
-            # ============================
             cur.execute("""
                 INSERT INTO dbo.ml_anuncios_cache (
                     empresa_id,
@@ -1714,12 +1684,8 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
         cn.commit()
         cn.close()
 
-        # ============================
-        # JOB OK
-        # ============================
         job_set_success(job_id, {
-            "ml_user_id": user_id,
-            "total_anuncios": len(base_items),
+            "total": len(base_items),
             "sincronizado_em": utcnow_naive().isoformat()
         })
 
@@ -1815,78 +1781,7 @@ def ml_anuncios(payload=Depends(require_auth)):
 
 
 
-@app.post("/ml/anuncios/sync")
-def ml_anuncios_sync(payload=Depends(require_auth)):
-    empresa_id = int(payload["empresa_id"])
 
-    try:
-        me = ml_me(empresa_id)
-        user_id = me["id"]
-
-        item_ids = ml_list_all_item_ids(
-            user_id=user_id,
-            empresa_id=empresa_id,
-            limit=50
-        )
-
-        items = ml_fetch_items_batch(item_ids, empresa_id=empresa_id)
-
-        cn = db()
-        cur = cn.cursor()
-
-        # Limpa cache anterior
-        cur.execute(
-            "DELETE FROM dbo.ml_anuncios_cache WHERE empresa_id = ?",
-            empresa_id
-        )
-
-        # 🔁 LOOP CORRETO
-        for it in items:
-            seller_sku, is_catalogo, tipo_anuncio = extract_ml_sku_and_tipo(it)
-
-            cur.execute("""
-                INSERT INTO dbo.ml_anuncios_cache (
-                    empresa_id,
-                    ml_item_id,
-                    titulo,
-                    seller_sku,
-                    is_catalogo,
-                    tipo_anuncio,
-                    status,
-                    status_raw,
-                    preco,
-                    estoque_ml,
-                    atualizado_em
-                )
-                VALUES (?,?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
-            """,
-            empresa_id,
-            it.get("id"),
-            it.get("title"),
-            seller_sku,
-            int(is_catalogo),
-            tipo_anuncio,
-            status_pt(it.get("status")),
-            it.get("status"),
-            it.get("price"),
-            it.get("available_quantity")
-            )
-
-        cn.commit()
-        cn.close()
-
-        return {
-            "ok": True,
-            "empresa_id": empresa_id,
-            "total": len(items),
-            "atualizado_em": utcnow_naive().isoformat()
-        }
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"ERRO REAL NO SYNC: {str(e)}"
-        )
 
 
 @app.get("/jobs/{job_id}")
