@@ -728,14 +728,12 @@ def extract_ml_sku_and_tipo(it: dict):
 # BUSCAR FULL MERCADO LIVRE
 # =========================
 
-def extract_ml_logistica(item: dict) -> dict:
+def extract_ml_logistica(item: dict):
     shipping = item.get("shipping") or {}
     logistic_type = shipping.get("logistic_type")
+    is_full = logistic_type == "fulfillment"
 
-    return {
-        "logistic_type": logistic_type,
-        "is_full": logistic_type == "fulfillment"
-    }
+    return logistic_type, is_full
 
 
 
@@ -1666,6 +1664,8 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
             # -------- LOGÍSTICA / FULL --------
             logistic_type, is_full = extract_ml_logistica(it)
 
+
+
             # 🔍 LOG DEFENSIVO
             if not seller_sku:
                 log(
@@ -2516,4 +2516,3 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
-
