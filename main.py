@@ -1607,10 +1607,10 @@ def job_get(job_id: int, empresa_id: int) -> dict | None:
 def ml_get_item_full(ml_item_id: str, empresa_id: int):
     """
     Busca o item completo no Mercado Livre.
-    Necessário para obter shipping.logistic_type (FULL / FLEX)
+    Necessário para obter shipping.logistic_type (FULFILLMENT / FLEX)
     """
-    return ml_get(
-        f"/items/{ml_item_id}",
+    return ml_get_empresa(
+        f"{ML_API}/items/{ml_item_id}",
         empresa_id=empresa_id
     )
 
@@ -2516,18 +2516,4 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
