@@ -728,20 +728,14 @@ def extract_ml_sku_and_tipo(it: dict):
 # BUSCAR FULL MERCADO LIVRE
 # =========================
 
-def extract_ml_logistica(item: dict):
-    """
-    Detecta se o anúncio é FULL (Mercado Envios FULL)
-    """
-    shipping = item.get("shipping")
-
-    if not shipping:
-        return None, False
-
+def extract_ml_logistica(item: dict) -> dict:
+    shipping = item.get("shipping") or {}
     logistic_type = shipping.get("logistic_type")
 
-    return logistic_type, logistic_type == "fulfillment"
- logistic_type, is_full
-
+    return {
+        "logistic_type": logistic_type,
+        "is_full": logistic_type == "fulfillment"
+    }
 
 
 
@@ -1635,7 +1629,7 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
         user_id = me["id"]
 
         # ============================
-        # LISTA IDS DE ANÚNCIOS
+        # LISTA IDS
         # ============================
         item_ids = ml_list_all_item_ids(
             user_id=user_id,
@@ -1643,15 +1637,16 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
             limit=50
         )
 
-        # ⚠️ ATENÇÃO:
-        # Esse batch NÃO traz shipping.logistic_type
+        # ============================
+        # FETCH BÁSICO
+        # ============================
         base_items = ml_fetch_items_batch(item_ids, empresa_id=empresa_id)
 
         cn = db()
         cur = cn.cursor()
 
         # ============================
-        # LIMPA CACHE ANTERIOR
+        # LIMPA CACHE
         # ============================
         cur.execute("""
             DELETE FROM dbo.ml_anuncios_cache
@@ -1659,36 +1654,26 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
         """, empresa_id)
 
         # ============================
-        # PROCESSA ANÚNCIOS
+        # PROCESSA ITENS
         # ============================
         for it_base in base_items:
-            # 🔥 ITEM COMPLETO (OBRIGATÓRIO PARA FULL)
+            # 🔹 ITEM COMPLETO (necessário p/ shipping.logistic_type)
             it = ml_get_item_full(it_base["id"], empresa_id)
 
-            # SKU / TIPO
+            # -------- SKU / TIPO --------
             seller_sku, is_catalogo, tipo_anuncio = extract_ml_sku_and_tipo(it)
 
-            # FULL / LOGÍSTICA
+            # -------- LOGÍSTICA / FULL --------
             logistic_type, is_full = extract_ml_logistica(it)
 
-                if logistic_type is None:
-                    log(
-                        "WARN",
-                        "Campo shipping ausente no item ML",
-                        ml_item_id=it.get("id"),
-                        keys=list(it.keys())
-                    )
-
-            # LOG DEFENSIVO
+            # 🔍 LOG DEFENSIVO
             if not seller_sku:
                 log(
                     "WARN",
                     "Anúncio sem seller_sku",
                     ml_item_id=it.get("id"),
                     titulo=it.get("title"),
-                    logistic_type=logistic_type,
-                    tem_variacoes=bool(it.get("variations")),
-                    catalog_product_id=it.get("catalog_product_id")
+                    logistic_type=logistic_type
                 )
 
             # ============================
@@ -1730,7 +1715,7 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
         cn.close()
 
         # ============================
-        # JOB FINALIZADO COM SUCESSO
+        # JOB OK
         # ============================
         job_set_success(job_id, {
             "ml_user_id": user_id,
@@ -2531,6 +2516,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
