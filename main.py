@@ -729,12 +729,25 @@ def extract_ml_sku_and_tipo(it: dict):
 # =========================
 
 def extract_ml_logistica(item: dict):
+    """
+    Determina corretamente se o anúncio é FULL (Mercado Envios Full)
+
+    Regras oficiais:
+    - shipping.logistic_type == 'fulfillment'
+    - OU tag 'fulfillment' presente
+    """
+
     shipping = item.get("shipping") or {}
     logistic_type = shipping.get("logistic_type")
-    is_full = logistic_type == "fulfillment"
+
+    tags = item.get("tags") or []
+
+    is_full = (
+        logistic_type == "fulfillment"
+        or "fulfillment" in tags
+    )
 
     return logistic_type, is_full
-
 
 
 def auto_vincular_sku_por_seller_sku(
