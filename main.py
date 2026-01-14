@@ -1610,6 +1610,33 @@ def job_get(job_id: int, empresa_id: int) -> dict | None:
         "erro": r.erro
     }
 
+@app.post("/ml/sincronizar-anuncios")
+def sincronizar_anuncios(payload=Depends(require_auth)):
+    """
+    Dispara a sincronização de anúncios do Mercado Livre
+    (FULL, catálogo, status, estoque, preço, etc.)
+    """
+    empresa_id = int(payload["empresa_id"])
+
+    # cria job
+    job_id = job_create("SYNC_ANUNCIOS", empresa_id)
+
+    try:
+        # executa de forma síncrona (como você já faz)
+        worker_sync_anuncios(job_id, empresa_id)
+
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "mensagem": "Sincronização de anúncios iniciada"
+        }
+
+    except Exception as e:
+        job_set_error(job_id, str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao sincronizar anúncios: {str(e)}"
+        )
 
 
 # ============================
