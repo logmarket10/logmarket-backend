@@ -1616,15 +1616,10 @@ def sincronizar_anuncios(
     background_tasks: BackgroundTasks,
     payload=Depends(require_auth)
 ):
-    """
-    Dispara a sincronização de anúncios do Mercado Livre
-    sem bloquear a requisição HTTP.
-    """
     empresa_id = int(payload["empresa_id"])
 
     job_id = job_create("SYNC_ANUNCIOS", empresa_id)
 
-    # 🔥 EXECUTA EM BACKGROUND
     background_tasks.add_task(
         worker_sync_anuncios,
         job_id,
@@ -1634,8 +1629,10 @@ def sincronizar_anuncios(
     return {
         "ok": True,
         "job_id": job_id,
-        "mensagem": "Sincronização iniciada em background"
+        "status": "PROCESSANDO",
+        "mensagem": "Sincronização de anúncios iniciada. Aguarde..."
     }
+
 
 
 
@@ -1780,8 +1777,10 @@ def ml_anuncios(payload=Depends(require_auth)):
             s.estoque_central
         FROM dbo.sku_anuncios sa
         JOIN dbo.sku s ON s.id = sa.sku_id
-        WHERE s.ativo = 1;
-    """)
+        WHERE s.ativo = 1
+          AND s.empresa_id = ?;
+    """, empresa_id)
+
 
     vinc = {}
     for r in cur.fetchall():
@@ -1798,24 +1797,27 @@ def ml_anuncios(payload=Depends(require_auth)):
     # ============================
     out = []
     for a in anuncios:
-        out.append({
-            "ml_item_id": a.ml_item_id,
-            "titulo": a.titulo,
-            "seller_sku": a.seller_sku,
-            "tipo_anuncio": a.tipo_anuncio,
-            "is_catalogo": bool(a.is_catalogo),
-            "status": a.status,
-            "status_raw": a.status_raw,
-            "estoque_ml": a.estoque_ml,
-            "preco": a.preco,
+          out.append({
+              "ml_item_id": a.ml_item_id,
+              "titulo": a.titulo,
+              "seller_sku": a.seller_sku,
+              "tipo_anuncio": a.tipo_anuncio,
+              "status": a.status,
+              "estoque_ml": a.estoque_ml,
+              "preco": a.preco,
 
-            # 🔥 NOVOS CAMPOS FULL
-            "is_full": bool(a.is_full),
-            "logistic_type": a.logistic_type,
+              "is_full": bool(a.is_full),
+              "logistic_type": a.logistic_type,
 
-            # SKU VINCULADO
-            "sku": vinc.get(str(a.ml_item_id))
-        })
+              "sku": vinc.get(str(a.ml_item_id)),
+
+              # 🔥 CONTROLE DE UX
+              "acao": (
+                  "DESVINCULAR"
+                  if str(a.ml_item_id) in vinc
+                  else "VINCULAR"
+              )
+          })
 
     return out
 
@@ -2451,3 +2453,4 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
