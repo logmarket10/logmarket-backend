@@ -2038,8 +2038,86 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
     try:
         reconciliados = 0
         divergencias = 0
+        produtos_analisados = 0
+        bootstrap = False
 
-        # 🔹 Todos os SKUs com estoque por CD
+        # =====================================================
+        # 1️⃣ VERIFICA SE JÁ EXISTE BASE DE ESTOQUE POR CD
+        # =====================================================
+        cur.execute("""
+            SELECT COUNT(1)
+            FROM dbo.ml_estoque_deposito
+            WHERE empresa_id = ?
+        """, empresa_id)
+
+        total_registros = int(cur.fetchone()[0] or 0)
+
+        # =====================================================
+        # 2️⃣ BOOTSTRAP INICIAL (SE TABELA ESTIVER VAZIA)
+        # =====================================================
+        if total_registros == 0:
+            bootstrap = True
+
+            # 🔹 Busca anúncios com user_product_id
+            cur.execute("""
+                SELECT DISTINCT
+                    sa.seller_sku,
+                    mac.ml_user_product_id
+                FROM dbo.sku_anuncios sa
+                JOIN dbo.ml_anuncios_cache mac
+                  ON mac.ml_item_id = sa.ml_item_id
+                WHERE mac.empresa_id = ?
+                  AND mac.ml_user_product_id IS NOT NULL
+            """, empresa_id)
+
+            produtos = cur.fetchall()
+
+            for p in produtos:
+                seller_sku = p.seller_sku
+                user_product_id = p.ml_user_product_id
+                produtos_analisados += 1
+
+                # 🔹 Consulta ML
+                data = ml_get_empresa(
+                    f"{ML_API}/user-products/{user_product_id}",
+                    empresa_id=empresa_id
+                )
+
+                stock = (data.get("stock") or {})
+                locations = stock.get("locations") or []
+
+                for loc in locations:
+                    store_id = loc.get("store_id")
+                    network_node_id = loc.get("network_node_id")
+                    qtd_ml = int(loc.get("available_quantity") or 0)
+
+                    # 🔹 INSERT inicial
+                    cur.execute("""
+                        INSERT INTO dbo.ml_estoque_deposito (
+                            empresa_id,
+                            seller_sku,
+                            ml_user_product_id,
+                            store_id,
+                            network_node_id,
+                            quantidade,
+                            criado_em,
+                            atualizado_em
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), SYSUTCDATETIME())
+                    """,
+                        empresa_id,
+                        seller_sku,
+                        user_product_id,
+                        store_id,
+                        network_node_id,
+                        qtd_ml
+                    )
+
+            cn.commit()
+
+        # =====================================================
+        # 3️⃣ RECONCILIAÇÃO NORMAL (ML = VERDADE)
+        # =====================================================
         cur.execute("""
             SELECT DISTINCT
                 seller_sku,
@@ -2053,8 +2131,8 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
         for p in produtos:
             seller_sku = p.seller_sku
             user_product_id = p.ml_user_product_id
+            produtos_analisados += 1
 
-            # 🔹 Busca estoque real no ML
             data = ml_get_empresa(
                 f"{ML_API}/user-products/{user_product_id}",
                 empresa_id=empresa_id
@@ -2067,7 +2145,6 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
                 store_id = loc.get("store_id")
                 qtd_ml = int(loc.get("available_quantity") or 0)
 
-                # 🔹 Estoque no banco
                 cur.execute("""
                     SELECT quantidade
                     FROM dbo.ml_estoque_deposito
@@ -2082,7 +2159,6 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
                 if qtd_ml != qtd_banco:
                     divergencias += 1
 
-                    # 🔧 Ajusta BANCO para refletir ML (ML = verdade)
                     cur.execute("""
                         UPDATE dbo.ml_estoque_deposito
                         SET quantidade = ?,
@@ -2092,7 +2168,6 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
                           AND store_id = ?
                     """, qtd_ml, empresa_id, seller_sku, store_id)
 
-                    # 📝 Log da reconciliação
                     cur.execute("""
                         INSERT INTO dbo.ml_reconciliacao_log (
                             empresa_id,
@@ -2118,13 +2193,16 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
 
         cn.commit()
 
+        # =====================================================
+        # 4️⃣ FINALIZA JOB
+        # =====================================================
         resultado = {
-            "produtos_analisados": len(produtos),
+            "bootstrap_executado": bootstrap,
+            "produtos_analisados": produtos_analisados,
             "divergencias_encontradas": divergencias,
             "registros_ajustados": reconciliados
         }
 
-        # ✅ FINALIZA JOB COM SUCESSO
         job_set_success(job_id, resultado)
 
     except Exception as e:
@@ -2134,6 +2212,7 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
 
     finally:
         cn.close()
+
 
 
 @app.post("/ml/reconciliar-estoque")
