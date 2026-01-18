@@ -1867,39 +1867,57 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
     job_set_processing(job_id)
 
     try:
+        # =====================================================
+        # 1️⃣ DADOS DA CONTA
+        # =====================================================
         me = ml_me(empresa_id)
         user_id = me["id"]
 
-        # 1️⃣ LISTA IDs
+        # =====================================================
+        # 2️⃣ LISTA TODOS OS IDS DE ITENS
+        # =====================================================
         item_ids = ml_list_all_item_ids(
             user_id=user_id,
             empresa_id=empresa_id,
             limit=50
         )
 
-        # 2️⃣ FETCH BÁSICO (ids válidos)
-        base_items = ml_fetch_items_batch(item_ids, empresa_id=empresa_id)
+        # =====================================================
+        # 3️⃣ FETCH BÁSICO (BATCH)
+        # =====================================================
+        base_items = ml_fetch_items_batch(
+            item_ids,
+            empresa_id=empresa_id
+        )
 
         cn = db()
         cur = cn.cursor()
 
-        # 3️⃣ LIMPA CACHE
+        # =====================================================
+        # 4️⃣ LIMPA CACHE (CACHE AUTORITATIVO)
+        # =====================================================
         cur.execute("""
             DELETE FROM dbo.ml_anuncios_cache
             WHERE empresa_id = ?;
         """, empresa_id)
 
-        # 4️⃣ PROCESSA UM A UM (ITEM COMPLETO)
+        # =====================================================
+        # 5️⃣ PROCESSA ITEM COMPLETO (DETALHE)
+        # =====================================================
         for it_base in base_items:
             it = ml_get_item_full(it_base["id"], empresa_id)
 
             seller_sku, is_catalogo, tipo_anuncio = extract_ml_sku_and_tipo(it)
             logistic_type, is_full = extract_ml_logistica(it)
 
+            # 🔹 NOVO: user_product_id (ESSENCIAL PARA MULTI-CD)
+            ml_user_product_id = it.get("user_product_id")
+
             cur.execute("""
                 INSERT INTO dbo.ml_anuncios_cache (
                     empresa_id,
                     ml_item_id,
+                    ml_user_product_id,
                     titulo,
                     seller_sku,
                     is_catalogo,
@@ -1912,10 +1930,11 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
                     is_full,
                     atualizado_em
                 )
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
             """,
                 empresa_id,
                 it.get("id"),
+                ml_user_product_id,              # ✅ NOVO
                 it.get("title"),
                 seller_sku,
                 int(is_catalogo),
@@ -1931,6 +1950,9 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
         cn.commit()
         cn.close()
 
+        # =====================================================
+        # 6️⃣ FINALIZA JOB
+        # =====================================================
         job_set_success(job_id, {
             "total": len(base_items),
             "sincronizado_em": utcnow_naive().isoformat()
@@ -1938,6 +1960,7 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
 
     except Exception as e:
         job_set_error(job_id, str(e))
+        raise
 
 # ============================
 # LISTAR ANÚNCIOS DO ML
@@ -2063,12 +2086,10 @@ def worker_bootstrap_estoque_cd(job_id: int, empresa_id: int):
         cur.execute("""
             SELECT DISTINCT
                 mac.seller_sku,
-                sa.ml_item_id
+                mac.ml_user_product_id
             FROM dbo.ml_anuncios_cache mac
-            JOIN dbo.sku_anuncios sa
-              ON sa.ml_item_id = mac.ml_item_id
             WHERE mac.empresa_id = ?
-              AND mac.seller_sku IS NOT NULL
+            AND mac.ml_user_product_id IS NOT NULL
         """, empresa_id)
 
         anuncios = cur.fetchall()
@@ -2228,20 +2249,19 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
         total_registros = int(cur.fetchone()[0] or 0)
 
         # =====================================================
-        # 2️⃣ BOOTSTRAP AUTOMÁTICO (PRIMEIRA EXECUÇÃO)
+        # 2️⃣ BOOTSTRAP AUTOMÁTICO (SE TABELA VAZIA)
         # =====================================================
         if total_registros == 0:
             bootstrap = True
 
+            # 🔹 Fonte correta: ml_anuncios_cache
             cur.execute("""
                 SELECT DISTINCT
-                    sa.seller_sku,
-                    mac.ml_user_product_id
-                FROM dbo.sku_anuncios sa
-                JOIN dbo.ml_anuncios_cache mac
-                  ON mac.ml_item_id = sa.ml_item_id
-                WHERE mac.empresa_id = ?
-                  AND mac.ml_user_product_id IS NOT NULL
+                    seller_sku,
+                    ml_user_product_id
+                FROM dbo.ml_anuncios_cache
+                WHERE empresa_id = ?
+                  AND ml_user_product_id IS NOT NULL
             """, empresa_id)
 
             produtos_bootstrap = cur.fetchall()
@@ -2251,6 +2271,7 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
                 user_product_id = p.ml_user_product_id
                 produtos_analisados += 1
 
+                # 🔹 Consulta estoque real no ML
                 data = ml_get_empresa(
                     f"{ML_API}/user-products/{user_product_id}",
                     empresa_id=empresa_id
@@ -2264,7 +2285,7 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
                     network_node_id = loc.get("network_node_id")
                     qtd_ml = int(loc.get("available_quantity") or 0)
 
-                    # 🔒 evita duplicidade (idempotente)
+                    # 🔒 Idempotência
                     cur.execute("""
                         SELECT 1
                         FROM dbo.ml_estoque_deposito
@@ -2300,23 +2321,29 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
             cn.commit()
 
         # =====================================================
-        # 3️⃣ RECONCILIAÇÃO (ML = FONTE DA VERDADE)
+        # 3️⃣ RECONCILIAÇÃO (ML = VERDADE)
         # =====================================================
         cur.execute("""
-            SELECT DISTINCT
+            SELECT
                 seller_sku,
-                ml_user_product_id
+                ml_user_product_id,
+                store_id,
+                quantidade
             FROM dbo.ml_estoque_deposito
             WHERE empresa_id = ?
         """, empresa_id)
 
-        produtos = cur.fetchall()
+        registros = cur.fetchall()
 
-        for p in produtos:
-            seller_sku = p.seller_sku
-            user_product_id = p.ml_user_product_id
+        for r in registros:
+            seller_sku = r.seller_sku
+            user_product_id = r.ml_user_product_id
+            store_id = r.store_id
+            qtd_banco = int(r.quantidade or 0)
+
             produtos_analisados += 1
 
+            # 🔹 Consulta ML
             data = ml_get_empresa(
                 f"{ML_API}/user-products/{user_product_id}",
                 empresa_id=empresa_id
@@ -2325,56 +2352,50 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
             stock = data.get("stock") or {}
             locations = stock.get("locations") or []
 
+            # 🔹 Localiza o CD correspondente
+            qtd_ml = 0
             for loc in locations:
-                store_id = loc.get("store_id")
-                qtd_ml = int(loc.get("available_quantity") or 0)
+                if loc.get("store_id") == store_id:
+                    qtd_ml = int(loc.get("available_quantity") or 0)
+                    break
 
+            if qtd_ml != qtd_banco:
+                divergencias += 1
+
+                # 🔧 Ajusta banco para refletir ML
                 cur.execute("""
-                    SELECT quantidade
-                    FROM dbo.ml_estoque_deposito
+                    UPDATE dbo.ml_estoque_deposito
+                    SET quantidade = ?,
+                        atualizado_em = SYSUTCDATETIME()
                     WHERE empresa_id = ?
                       AND seller_sku = ?
                       AND store_id = ?
-                """, empresa_id, seller_sku, store_id)
+                """, qtd_ml, empresa_id, seller_sku, store_id)
 
-                row = cur.fetchone()
-                qtd_banco = int(row.quantidade) if row else 0
-
-                if qtd_ml != qtd_banco:
-                    divergencias += 1
-
-                    cur.execute("""
-                        UPDATE dbo.ml_estoque_deposito
-                        SET quantidade = ?,
-                            atualizado_em = SYSUTCDATETIME()
-                        WHERE empresa_id = ?
-                          AND seller_sku = ?
-                          AND store_id = ?
-                    """, qtd_ml, empresa_id, seller_sku, store_id)
-
-                    cur.execute("""
-                        INSERT INTO dbo.ml_reconciliacao_log (
-                            empresa_id,
-                            seller_sku,
-                            ml_user_product_id,
-                            store_id,
-                            qtd_ml,
-                            qtd_banco,
-                            diferenca,
-                            criado_em
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME())
-                    """,
+                # 📝 Log
+                cur.execute("""
+                    INSERT INTO dbo.ml_reconciliacao_log (
                         empresa_id,
                         seller_sku,
-                        user_product_id,
+                        ml_user_product_id,
                         store_id,
                         qtd_ml,
                         qtd_banco,
-                        qtd_ml - qtd_banco
+                        diferenca,
+                        criado_em
                     )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME())
+                """,
+                    empresa_id,
+                    seller_sku,
+                    user_product_id,
+                    store_id,
+                    qtd_ml,
+                    qtd_banco,
+                    qtd_ml - qtd_banco
+                )
 
-                    reconciliados += 1
+                reconciliados += 1
 
         cn.commit()
 
@@ -3230,5 +3251,6 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
