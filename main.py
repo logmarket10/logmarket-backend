@@ -5,6 +5,7 @@ import bcrypt
 import pyodbc
 import requests
 import traceback
+import time
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -2162,6 +2163,190 @@ def worker_bootstrap_estoque_cd(job_id: int, empresa_id: int):
 
     finally:
         cn.close()
+
+# ============================
+# update cd ML
+# ============================
+
+
+class AtualizarEstoqueCDPayload(BaseModel):
+    seller_sku: str
+    ml_user_product_id: str
+    store_id: str
+    quantidade: int
+
+
+@app.put("/ml/estoque/cd/update")
+def atualizar_estoque_cd(
+    payload: AtualizarEstoqueCDPayload,
+    auth=Depends(require_auth)
+):
+    empresa_id = int(auth["empresa_id"])
+
+    body = {
+        "locations": [
+            {
+                "store_id": payload.store_id,
+                "available_quantity": payload.quantidade
+            }
+        ]
+    }
+
+    resp = ml_put_empresa(
+        f"{ML_API}/user-products/{payload.ml_user_product_id}/stock",
+        empresa_id=empresa_id,
+        json=body
+    )
+
+    return {
+        "ok": True,
+        "seller_sku": payload.seller_sku,
+        "ml_user_product_id": payload.ml_user_product_id,
+        "store_id": payload.store_id,
+        "quantidade": payload.quantidade,
+        "ml_response": resp
+    }
+
+
+
+def worker_ativar_cd_automatico(job_id: int, empresa_id: int):
+    job_set_processing(job_id)
+
+    cn = db()
+    cur = cn.cursor()
+
+    ativados = 0
+    ignorados = 0
+    erros = 0
+    processados = 0
+
+    try:
+        # 🔹 Produtos com user_product_id
+        cur.execute("""
+            SELECT DISTINCT
+                mac.seller_sku,
+                mac.ml_user_product_id
+            FROM dbo.ml_anuncios_cache mac
+            WHERE mac.empresa_id = ?
+              AND mac.ml_user_product_id IS NOT NULL
+        """, empresa_id)
+
+        produtos = cur.fetchall()
+
+        for p in produtos:
+            seller_sku = p.seller_sku
+            user_product_id = p.ml_user_product_id
+            processados += 1
+
+            try:
+                # 🔎 Consulta produto no ML
+                data = ml_get_empresa(
+                    f"{ML_API}/user-products/{user_product_id}",
+                    empresa_id=empresa_id
+                )
+
+                stock = data.get("stock") or {}
+
+                # ✅ CD já ativo → ignora
+                if stock.get("type") == "seller_warehouse":
+                    ignorados += 1
+                    continue
+
+                # 🔹 Ativa CD com quantidade 0
+                payload_ml = {
+                    "locations": [
+                        {
+                            "store_id": None,
+                            "available_quantity": 0
+                        }
+                    ]
+                }
+
+                ml_put_empresa(
+                    f"{ML_API}/user-products/{user_product_id}/stock",
+                    empresa_id=empresa_id,
+                    payload=payload_ml
+                )
+
+                ativados += 1
+
+            except Exception as e:
+                erros += 1
+                log(
+                    "ERRO",
+                    "Falha ao ativar CD automático",
+                    sku=seller_sku,
+                    user_product_id=user_product_id,
+                    erro=str(e)
+                )
+
+            # 🧠 RATE LIMIT SAFE (ML + Azure)
+            time.sleep(0.35)
+
+            # 🔄 Commit periódico (a cada 20)
+            if processados % 20 == 0:
+                cn.commit()
+
+        cn.commit()
+
+        job_set_success(job_id, {
+            "produtos_total": len(produtos),
+            "processados": processados,
+            "cd_ativados": ativados,
+            "ignorados": ignorados,
+            "erros": erros,
+            "sleep_por_item": 0.35
+        })
+
+    except Exception as e:
+        cn.rollback()
+        job_set_error(job_id, str(e))
+        raise
+
+    finally:
+        cn.close()
+
+
+
+@app.post("/ml/estoque/cd/ativar-automatico")
+def ativar_cd_automatico(
+    background_tasks: BackgroundTasks,
+    payload=Depends(require_auth)
+):
+    empresa_id = int(payload["empresa_id"])
+
+    # 🔒 Só permite se multi-CD estiver ativo
+    cn = db()
+    cur = cn.cursor()
+    cur.execute("""
+        SELECT warehouse_management
+        FROM dbo.ml_configuracao_conta
+        WHERE empresa_id = ?
+    """, empresa_id)
+
+    cfg = cur.fetchone()
+    cn.close()
+
+    if not cfg or int(cfg.warehouse_management) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Conta não configurada para estoque multi-CD."
+        )
+
+    job_id = job_create("ATIVAR_CD_AUTOMATICO", empresa_id)
+
+    background_tasks.add_task(
+        worker_ativar_cd_automatico,
+        job_id,
+        empresa_id
+    )
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "PROCESSANDO",
+        "mensagem": "Ativação automática de CD iniciada."
+    }
 
 
 # ============================
