@@ -2031,6 +2031,181 @@ def ml_anuncios(payload=Depends(require_auth)):
 
     return out
 
+# ============================
+# WORKER BOOTSTRAP ESTOQUE CD
+# ============================
+def worker_bootstrap_estoque_cd(job_id: int, empresa_id: int):
+    job_set_processing(job_id)
+
+    cn = db()
+    cur = cn.cursor()
+
+    try:
+        inseridos = 0
+        ignorados = 0
+        produtos_processados = 0
+
+        # 🔹 Busca anúncios que possuem user_product_id
+        cur.execute("""
+            SELECT DISTINCT
+                seller_sku,
+                ml_user_product_id
+            FROM dbo.ml_estoque_deposito
+            WHERE empresa_id = ?
+        """, empresa_id)
+
+        existentes = {
+            (r.seller_sku, r.ml_user_product_id)
+            for r in cur.fetchall()
+        }
+
+        # 🔹 Busca anúncios do cache ML
+        cur.execute("""
+            SELECT DISTINCT
+                mac.seller_sku,
+                sa.ml_item_id
+            FROM dbo.ml_anuncios_cache mac
+            JOIN dbo.sku_anuncios sa
+              ON sa.ml_item_id = mac.ml_item_id
+            WHERE mac.empresa_id = ?
+              AND mac.seller_sku IS NOT NULL
+        """, empresa_id)
+
+        anuncios = cur.fetchall()
+
+        for a in anuncios:
+            seller_sku = a.seller_sku
+            ml_item_id = a.ml_item_id
+
+            # 🔹 Descobre user_product_id no ML
+            data = ml_get_empresa(
+                f"{ML_API}/items/{ml_item_id}",
+                empresa_id=empresa_id
+            )
+
+            user_product_id = data.get("user_product_id")
+            if not user_product_id:
+                continue
+
+            produtos_processados += 1
+
+            # 🔹 Busca estoque real no ML
+            up = ml_get_empresa(
+                f"{ML_API}/user-products/{user_product_id}",
+                empresa_id=empresa_id
+            )
+
+            stock = up.get("stock") or {}
+            locations = stock.get("locations") or []
+
+            for loc in locations:
+                store_id = loc.get("store_id")
+                qtd = int(loc.get("available_quantity") or 0)
+
+                # 🔒 Evita duplicidade
+                cur.execute("""
+                    SELECT 1
+                    FROM dbo.ml_estoque_deposito
+                    WHERE empresa_id = ?
+                      AND seller_sku = ?
+                      AND store_id = ?
+                """, empresa_id, seller_sku, store_id)
+
+                if cur.fetchone():
+                    ignorados += 1
+                    continue
+
+                # 🔹 INSERE ESTOQUE INICIAL
+                cur.execute("""
+                    INSERT INTO dbo.ml_estoque_deposito (
+                        empresa_id,
+                        seller_sku,
+                        ml_item_id,
+                        ml_user_product_id,
+                        store_id,
+                        quantidade,
+                        ultima_sincronizacao,
+                        criado_em,
+                        atualizado_em
+                    )
+                    VALUES (
+                        ?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME()
+                    )
+                """,
+                    empresa_id,
+                    seller_sku,
+                    ml_item_id,
+                    user_product_id,
+                    store_id,
+                    qtd
+                )
+
+                inseridos += 1
+
+        cn.commit()
+
+        job_set_success(job_id, {
+            "produtos_processados": produtos_processados,
+            "registros_inseridos": inseridos,
+            "registros_ignorados": ignorados
+        })
+
+    except Exception as e:
+        cn.rollback()
+        job_set_error(job_id, str(e))
+        raise
+
+    finally:
+        cn.close()
+
+
+# ============================
+# ENDPOINT BOOTSTRAP
+# ============================
+@app.post("/ml/estoque/cd/bootstrap")
+def bootstrap_estoque_cd(
+    background_tasks: BackgroundTasks,
+    payload=Depends(require_auth)
+):
+    empresa_id = int(payload["empresa_id"])
+
+    # 🔒 Só permite se multi-CD estiver ativo
+    cn = db()
+    cur = cn.cursor()
+    cur.execute("""
+        SELECT warehouse_management
+        FROM dbo.ml_configuracao_conta
+        WHERE empresa_id = ?
+    """, empresa_id)
+
+    cfg = cur.fetchone()
+    cn.close()
+
+    if not cfg or int(cfg.warehouse_management) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Conta não configurada para estoque multi-CD."
+        )
+
+    job_id = job_create("BOOTSTRAP_ESTOQUE_CD", empresa_id)
+
+    background_tasks.add_task(
+        worker_bootstrap_estoque_cd,
+        job_id,
+        empresa_id
+    )
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "PROCESSANDO",
+        "mensagem": "Bootstrap inicial de estoque por CD iniciado."
+    }
+
+
+
+
+
 def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
     cn = db()
     cur = cn.cursor()
@@ -2042,7 +2217,7 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
         bootstrap = False
 
         # =====================================================
-        # 1️⃣ VERIFICA SE JÁ EXISTE BASE DE ESTOQUE POR CD
+        # 1️⃣ EXISTE ESTOQUE POR CD PARA A EMPRESA?
         # =====================================================
         cur.execute("""
             SELECT COUNT(1)
@@ -2053,12 +2228,11 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
         total_registros = int(cur.fetchone()[0] or 0)
 
         # =====================================================
-        # 2️⃣ BOOTSTRAP INICIAL (SE TABELA ESTIVER VAZIA)
+        # 2️⃣ BOOTSTRAP AUTOMÁTICO (PRIMEIRA EXECUÇÃO)
         # =====================================================
         if total_registros == 0:
             bootstrap = True
 
-            # 🔹 Busca anúncios com user_product_id
             cur.execute("""
                 SELECT DISTINCT
                     sa.seller_sku,
@@ -2070,20 +2244,19 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
                   AND mac.ml_user_product_id IS NOT NULL
             """, empresa_id)
 
-            produtos = cur.fetchall()
+            produtos_bootstrap = cur.fetchall()
 
-            for p in produtos:
+            for p in produtos_bootstrap:
                 seller_sku = p.seller_sku
                 user_product_id = p.ml_user_product_id
                 produtos_analisados += 1
 
-                # 🔹 Consulta ML
                 data = ml_get_empresa(
                     f"{ML_API}/user-products/{user_product_id}",
                     empresa_id=empresa_id
                 )
 
-                stock = (data.get("stock") or {})
+                stock = data.get("stock") or {}
                 locations = stock.get("locations") or []
 
                 for loc in locations:
@@ -2091,7 +2264,18 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
                     network_node_id = loc.get("network_node_id")
                     qtd_ml = int(loc.get("available_quantity") or 0)
 
-                    # 🔹 INSERT inicial
+                    # 🔒 evita duplicidade (idempotente)
+                    cur.execute("""
+                        SELECT 1
+                        FROM dbo.ml_estoque_deposito
+                        WHERE empresa_id = ?
+                          AND seller_sku = ?
+                          AND store_id = ?
+                    """, empresa_id, seller_sku, store_id)
+
+                    if cur.fetchone():
+                        continue
+
                     cur.execute("""
                         INSERT INTO dbo.ml_estoque_deposito (
                             empresa_id,
@@ -2116,7 +2300,7 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
             cn.commit()
 
         # =====================================================
-        # 3️⃣ RECONCILIAÇÃO NORMAL (ML = VERDADE)
+        # 3️⃣ RECONCILIAÇÃO (ML = FONTE DA VERDADE)
         # =====================================================
         cur.execute("""
             SELECT DISTINCT
@@ -2138,7 +2322,7 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
                 empresa_id=empresa_id
             )
 
-            stock = (data.get("stock") or {})
+            stock = data.get("stock") or {}
             locations = stock.get("locations") or []
 
             for loc in locations:
@@ -2176,9 +2360,10 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
                             store_id,
                             qtd_ml,
                             qtd_banco,
-                            diferenca
+                            diferenca,
+                            criado_em
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME())
                     """,
                         empresa_id,
                         seller_sku,
@@ -2212,6 +2397,7 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
 
     finally:
         cn.close()
+
 
 
 
