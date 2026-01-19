@@ -2723,6 +2723,34 @@ def get_estoque_full(
     }
 
 
+# ============================
+# SINCRONIZAR ESTOQUE FULL (ML)
+# ============================
+@app.post("/ml/estoque/full/sync")
+def sync_estoque_full(
+    background_tasks: BackgroundTasks,
+    payload=Depends(require_auth)
+):
+    empresa_id = int(payload["empresa_id"])
+
+    # cria job
+    job_id = job_create("SYNC_ESTOQUE_FULL", empresa_id)
+
+    # executa em background
+    background_tasks.add_task(
+        worker_sync_estoque_full,
+        job_id,
+        empresa_id
+    )
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "PROCESSANDO",
+        "mensagem": "Sincronização de estoque FULL iniciada."
+    }
+
+
 
 @app.post("/ml/reconciliar-estoque")
 def reconciliar_estoque(
