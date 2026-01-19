@@ -2094,17 +2094,16 @@ def worker_bootstrap_estoque_cd(job_id: int, empresa_id: int):
             # 🔹 Busca estoque real no Mercado Livre (por CD)
             # =====================================================
             up = ml_get_empresa(
-                f"{ML_API}/user-products/{user_product_id}",
+                f"{ML_API}/user-products/{user_product_id}/stock",
                 empresa_id=empresa_id
             )
 
-            stock = up.get("stock") or {}
-            locations = stock.get("locations") or []
+            locations = up.get("locations") or []
 
             for loc in locations:
                 store_id = loc.get("store_id")
                 network_node_id = loc.get("network_node_id")
-                qtd = int(loc.get("available_quantity") or 0)
+                qtd = int(loc.get("quantity") or 0)
 
                 # 🔒 Evita duplicidade
                 cur.execute("""
@@ -2195,7 +2194,7 @@ def atualizar_estoque_cd(
     resp = ml_put_empresa(
         f"{ML_API}/user-products/{payload.ml_user_product_id}/stock",
         empresa_id=empresa_id,
-        json=body
+        payload=body
     )
 
     return {
@@ -2241,16 +2240,16 @@ def worker_ativar_cd_automatico(job_id: int, empresa_id: int):
             try:
                 # 🔎 Consulta produto no ML
                 data = ml_get_empresa(
-                    f"{ML_API}/user-products/{user_product_id}",
+                    f"{ML_API}/user-products/{user_product_id}/stock",
                     empresa_id=empresa_id
                 )
 
-                stock = data.get("stock") or {}
+                locations = data.get("locations") or []
 
-                # ✅ CD já ativo → ignora
-                if stock.get("type") == "seller_warehouse":
+                if locations:
                     ignorados += 1
                     continue
+
 
                 # 🔹 Ativa CD com quantidade 0
                 payload_ml = {
@@ -2442,17 +2441,16 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
 
                 # 🔹 Consulta estoque real no ML
                 data = ml_get_empresa(
-                    f"{ML_API}/user-products/{user_product_id}",
+                    f"{ML_API}/user-products/{user_product_id}/stock",
                     empresa_id=empresa_id
                 )
 
-                stock = data.get("stock") or {}
-                locations = stock.get("locations") or []
+                locations = data.get("locations") or []
 
                 for loc in locations:
                     store_id = loc.get("store_id")
                     network_node_id = loc.get("network_node_id")
-                    qtd_ml = int(loc.get("available_quantity") or 0)
+                    qtd_ml = int(loc.get("quantity") or 0)
 
                     # 🔒 Idempotência
                     cur.execute("""
@@ -2514,18 +2512,18 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
 
             # 🔹 Consulta ML
             data = ml_get_empresa(
-                f"{ML_API}/user-products/{user_product_id}",
+                f"{ML_API}/user-products/{user_product_id}/stock",
                 empresa_id=empresa_id
             )
 
-            stock = data.get("stock") or {}
-            locations = stock.get("locations") or []
+            locations = data.get("locations") or []
+
 
             # 🔹 Localiza o CD correspondente
             qtd_ml = 0
             for loc in locations:
                 if loc.get("store_id") == store_id:
-                    qtd_ml = int(loc.get("available_quantity") or 0)
+                    qtd_ml = int(loc.get("quantity") or 0)
                     break
 
             if qtd_ml != qtd_banco:
