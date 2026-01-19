@@ -1964,7 +1964,7 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
         raise
 
 # ============================
-# LISTAR ANÚNCIOS DO ML
+# LISTAR ANÚNCIOS DO ML (CONSOLIDADO)
 # ============================
 @app.get("/ml/anuncios")
 def ml_anuncios(payload=Depends(require_auth)):
@@ -1974,7 +1974,7 @@ def ml_anuncios(payload=Depends(require_auth)):
     cur = cn.cursor()
 
     # ============================
-    # CACHE DE ANÚNCIOS (ML)
+    # ANÚNCIOS + ESTOQUE FULL
     # ============================
     cur.execute("""
         SELECT
@@ -1989,11 +1989,17 @@ def ml_anuncios(payload=Depends(require_auth)):
             mac.estoque_ml,
             mac.is_full,
             mac.logistic_type,
+
+            ISNULL(ef.quantidade, 0) AS estoque_full,
+
             sa.origem_vinculo
         FROM dbo.ml_anuncios_cache mac
+        LEFT JOIN dbo.ml_estoque_full ef
+               ON ef.ml_item_id = mac.ml_item_id
+              AND ef.empresa_id = mac.empresa_id
         LEFT JOIN dbo.sku_anuncios sa
-          ON sa.ml_item_id = mac.ml_item_id
-         AND sa.sku_id IS NOT NULL
+               ON sa.ml_item_id = mac.ml_item_id
+              AND sa.sku_id IS NOT NULL
         WHERE mac.empresa_id = ?
         ORDER BY mac.titulo;
     """, empresa_id)
@@ -2001,57 +2007,72 @@ def ml_anuncios(payload=Depends(require_auth)):
     anuncios = cur.fetchall()
 
     # ============================
-    # VÍNCULOS SKU
+    # VÍNCULOS SKU + ESTOQUE CD
     # ============================
     cur.execute("""
         SELECT
             sa.ml_item_id,
             s.codigo,
             s.nome,
-            s.estoque_central
+            s.estoque_central,
+
+            ISNULL((
+                SELECT SUM(e.quantidade)
+                FROM dbo.ml_estoque_deposito e
+                WHERE e.empresa_id = ?
+                  AND e.seller_sku = s.codigo
+            ), 0) AS estoque_cd
         FROM dbo.sku_anuncios sa
-        JOIN dbo.sku s ON s.id = sa.sku_id
+        JOIN dbo.sku s
+          ON s.id = sa.sku_id
         WHERE s.ativo = 1
           AND s.empresa_id = ?;
-    """, empresa_id)
-
+    """, empresa_id, empresa_id)
 
     vinc = {}
     for r in cur.fetchall():
         vinc[str(r.ml_item_id)] = {
             "sku_codigo": r.codigo,
             "sku_nome": r.nome,
+            "estoque_cd": int(r.estoque_cd or 0),
             "estoque_central": int(r.estoque_central or 0)
         }
 
     cn.close()
 
     # ============================
-    # SERIALIZAÇÃO FINAL
+    # SERIALIZAÇÃO FINAL (PRONTA PARA UI)
     # ============================
     out = []
     for a in anuncios:
-          out.append({
-              "ml_item_id": a.ml_item_id,
-              "titulo": a.titulo,
-              "seller_sku": a.seller_sku,
-              "tipo_anuncio": a.tipo_anuncio,
-              "status": a.status,
-              "estoque_ml": a.estoque_ml,
-              "preco": a.preco,
+        sku = vinc.get(str(a.ml_item_id))
 
-              "is_full": bool(a.is_full),
-              "logistic_type": a.logistic_type,
+        estoque_full = int(a.estoque_full or 0)
+        estoque_cd = int(sku["estoque_cd"]) if sku else 0
 
-              "sku": vinc.get(str(a.ml_item_id)),
+        out.append({
+            "ml_item_id": a.ml_item_id,
+            "titulo": a.titulo,
+            "seller_sku": a.seller_sku,
 
-              # 🔥 CONTROLE DE UX
-              "acao": (
-                  "DESVINCULAR"
-                  if str(a.ml_item_id) in vinc
-                  else "VINCULAR"
-              )
-          })
+            "tipo_anuncio": a.tipo_anuncio,          # CATALOGO / LISTA
+            "is_catalogo": bool(a.is_catalogo),
+
+            "status": a.status,
+            "preco": a.preco,
+
+            "is_full": bool(a.is_full),
+            "logistic_type": a.logistic_type,
+
+            "estoque_full": estoque_full,
+            "estoque_cd": estoque_cd,
+            "estoque_total": estoque_full + estoque_cd,
+
+            "sku": sku,
+
+            # 🔥 CONTROLE DE UX
+            "acao": "DESVINCULAR" if sku else "VINCULAR"
+        })
 
     return out
 
