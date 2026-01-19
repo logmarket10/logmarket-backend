@@ -2064,92 +2064,85 @@ def worker_bootstrap_estoque_cd(job_id: int, empresa_id: int):
     cn = db()
     cur = cn.cursor()
 
-    try:
-        inseridos = 0
-        ignorados = 0
-        produtos_processados = 0
+    inseridos = 0
+    ignorados = 0
+    produtos_processados = 0
 
-        # =====================================================
-        # 🔹 Busca anúncios válidos no cache (FONTE CORRETA)
-        # =====================================================
+    try:
         cur.execute("""
             SELECT DISTINCT
-                mac.seller_sku,
-                mac.ml_user_product_id
-            FROM dbo.ml_anuncios_cache mac
-            WHERE mac.empresa_id = ?
-              AND mac.ml_user_product_id IS NOT NULL
-              AND mac.seller_sku IS NOT NULL
+                seller_sku,
+                ml_user_product_id
+            FROM dbo.ml_anuncios_cache
+            WHERE empresa_id = ?
+              AND ml_user_product_id IS NOT NULL
+              AND seller_sku IS NOT NULL
         """, empresa_id)
 
-        anuncios = cur.fetchall()
+        produtos = cur.fetchall()
 
-        for a in anuncios:
-            seller_sku = a.seller_sku
-            user_product_id = a.ml_user_product_id
-
+        for p in produtos:
+            seller_sku = p.seller_sku
+            user_product_id = p.ml_user_product_id
             produtos_processados += 1
 
-            # =====================================================
-            # 🔹 Busca estoque real no Mercado Livre (por CD)
-            # =====================================================
-            up = ml_get_empresa(
+            data = ml_get_empresa(
                 f"{ML_API}/user-products/{user_product_id}/stock",
                 empresa_id=empresa_id
             )
 
-            locations = up.get("locations") or []
+            locations = data.get("locations") or []
 
             for loc in locations:
-                store_id = loc.get("store_id")
+                if loc.get("type") != "seller_warehouse":
+                    ignorados += 1
+                    continue
 
-                # ❗ REGRA CRÍTICA
+                store_id = loc.get("store_id")
                 if not store_id:
-                    continue  # ignora meli_facility, central, etc.
+                    ignorados += 1
+                    continue
 
                 network_node_id = loc.get("network_node_id")
                 qtd = int(loc.get("quantity") or 0)
 
-                # evita duplicidade
                 cur.execute("""
                     SELECT 1
                     FROM dbo.ml_estoque_deposito
                     WHERE empresa_id = ?
-                    AND seller_sku = ?
-                    AND store_id = ?
+                      AND seller_sku = ?
+                      AND store_id = ?
                 """, empresa_id, seller_sku, store_id)
 
                 if cur.fetchone():
+                    ignorados += 1
                     continue
 
-                # =====================================================
-                # ➕ INSERE ESTOQUE INICIAL POR CD
-                # =====================================================
-                    cur.execute("""
-                        INSERT INTO dbo.ml_estoque_deposito (
-                            empresa_id,
-                            seller_sku,
-                            ml_item_id,
-                            ml_user_product_id,
-                            store_id,
-                            quantidade,
-                            ultima_sincronizacao,
-                            criado_em,
-                            atualizado_em
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME())
-                    """,
+                cur.execute("""
+                    INSERT INTO dbo.ml_estoque_deposito (
                         empresa_id,
                         seller_sku,
-                        ml_item_id,
-                        user_product_id,
+                        ml_user_product_id,
                         store_id,
-                        qtd
+                        network_node_id,
+                        quantidade,
+                        ultima_sincronizacao,
+                        criado_em,
+                        atualizado_em
                     )
+                    VALUES (?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME())
+                """,
+                    empresa_id,
+                    seller_sku,
+                    user_product_id,
+                    store_id,
+                    network_node_id,
+                    qtd
+                )
 
                 inseridos += 1
 
-        cn.commit()
+            cn.commit()  # commit por produto (seguro)
 
         job_set_success(job_id, {
             "produtos_processados": produtos_processados,
@@ -2164,6 +2157,7 @@ def worker_bootstrap_estoque_cd(job_id: int, empresa_id: int):
 
     finally:
         cn.close()
+
 
 # ============================
 # update cd ML
