@@ -2593,7 +2593,134 @@ def worker_reconciliar_estoque_ml(job_id: int, empresa_id: int):
     finally:
         cn.close()
 
+# ============================
+# consulta estoque full
+# ============================
+def worker_sync_estoque_full(job_id: int, empresa_id: int):
+    cn = db()
+    cur = cn.cursor()
 
+    processados = 0
+    inseridos = 0
+    atualizados = 0
+
+    try:
+        # 🔹 Busca anúncios da empresa
+        cur.execute("""
+            SELECT DISTINCT
+                ml_item_id,
+                seller_sku
+            FROM dbo.ml_anuncios_cache
+            WHERE empresa_id = ?
+              AND ml_item_id IS NOT NULL
+        """, empresa_id)
+
+        anuncios = cur.fetchall()
+
+        for a in anuncios:
+            ml_item_id = a.ml_item_id
+            seller_sku = a.seller_sku
+            processados += 1
+
+            # 🔹 Consulta item no ML
+            item = ml_get_empresa(
+                f"{ML_API}/items/{ml_item_id}",
+                empresa_id=empresa_id
+            )
+
+            shipping = item.get("shipping") or {}
+            logistic_type = shipping.get("logistic_type")
+
+            # ❗ Só FULL
+            if logistic_type != "fulfillment":
+                continue
+
+            quantidade = int(item.get("available_quantity") or 0)
+
+            # 🔹 UPSERT
+            cur.execute("""
+                MERGE dbo.ml_estoque_full AS tgt
+                USING (SELECT ? AS empresa_id, ? AS ml_item_id) AS src
+                ON tgt.empresa_id = src.empresa_id
+               AND tgt.ml_item_id = src.ml_item_id
+                WHEN MATCHED THEN
+                    UPDATE SET
+                        quantidade = ?,
+                        seller_sku = ?,
+                        logistic_type = 'fulfillment',
+                        ultima_sincronizacao = SYSUTCDATETIME(),
+                        atualizado_em = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN
+                    INSERT (
+                        empresa_id,
+                        ml_item_id,
+                        seller_sku,
+                        quantidade,
+                        logistic_type,
+                        ultima_sincronizacao,
+                        criado_em,
+                        atualizado_em
+                    )
+                    VALUES (?, ?, ?, ?, 'fulfillment', SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME());
+            """,
+                empresa_id, ml_item_id,
+                quantidade, seller_sku,
+                empresa_id, ml_item_id, seller_sku, quantidade
+            )
+
+            if cur.rowcount == 1:
+                inseridos += 1
+            else:
+                atualizados += 1
+
+        cn.commit()
+
+        job_set_success(job_id, {
+                "processados": processados,
+                "inseridos": inseridos,
+                "atualizados": atualizados
+            })
+
+    except Exception as e:
+        cn.rollback()
+        job_set_error(job_id, str(e))
+        raise
+
+
+@app.get("/ml/estoque/full/{seller_sku}")
+def get_estoque_full(
+    seller_sku: str,
+    payload=Depends(require_auth)
+):
+    empresa_id = int(payload["empresa_id"])
+
+    cn = db()
+    cur = cn.cursor()
+
+    cur.execute("""
+        SELECT
+            ml_item_id,
+            quantidade,
+            ultima_sincronizacao
+        FROM dbo.ml_estoque_full
+        WHERE empresa_id = ?
+          AND seller_sku = ?
+    """, empresa_id, seller_sku)
+
+    row = cur.fetchone()
+
+    if not row:
+        return {
+            "seller_sku": seller_sku,
+            "estoque_full": 0,
+            "ultima_sincronizacao": None
+        }
+
+    return {
+        "seller_sku": seller_sku,
+        "estoque_full": row.quantidade,
+        "ultima_sincronizacao": row.ultima_sincronizacao
+    }
 
 
 
