@@ -1001,12 +1001,21 @@ def ml_get_empresa(url: str, empresa_id: int, params=None):
 def ml_put_empresa(url: str, empresa_id: int, payload: dict):
     r = requests.put(
         url,
-        headers={**ml_headers_empresa(empresa_id), "Content-Type": "application/json"},
+        headers={
+            **ml_headers_empresa(empresa_id),
+            "Content-Type": "application/json",
+            "X-Version": "2"   # ✅ OBRIGATÓRIO PARA ESTOQUE / USER-PRODUCTS
+        },
         json=payload,
         timeout=30
     )
+
     if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"Erro ML PUT: {r.status_code} - {r.text[:800]}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Erro ML PUT: {r.status_code} - {r.text[:800]}"
+        )
+
     return r.json()
 
 
@@ -3602,6 +3611,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
