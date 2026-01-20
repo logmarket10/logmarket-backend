@@ -1310,6 +1310,7 @@ def ml_update_estoque_cd(
         "quantidade": data.quantidade
     }
 
+
 @app.get("/ml/estoque/cd/{seller_sku}")
 def ml_get_estoque_por_cd(
     seller_sku: str,
