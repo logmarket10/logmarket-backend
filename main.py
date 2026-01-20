@@ -1154,9 +1154,11 @@ def ml_fetch_paid_orders_since(dt_from: datetime, empresa_id: int, hard_limit=10
 # =========================
 class EstoqueCDIn(BaseModel):
     seller_sku: str
-    ml_user_product_id: str
+    ml_user_product_id: str | None = None
+    inventory_id: str
     store_id: str
     quantidade: int
+
 
 
 @app.post("/ml/depositos/sync")
@@ -1237,79 +1239,7 @@ def ml_sync_depositos(payload=Depends(require_auth)):
         "depositos": len(stores)
     }
 
-@app.put("/ml/estoque/cd/update")
-def ml_update_estoque_cd(
-    data: EstoqueCDIn,
-    payload=Depends(require_auth)
-):
-    empresa_id = int(payload["empresa_id"])
 
-    if data.quantidade < 0:
-        raise HTTPException(status_code=400, detail="Quantidade inválida")
-
-    # ✅ Recurso correto para “Nos seus depósitos”
-    url = f"{ML_API}/user-products/{data.ml_user_product_id}/stock/type/seller_warehouse"
-
-    # ✅ Body correto: quantity (não available_quantity)
-    payload_ml = {
-        "locations": [
-            {
-                "store_id": data.store_id,
-                "quantity": int(data.quantidade)
-            }
-        ]
-    }
-
-    ml_resp = ml_put_empresa(url, empresa_id=empresa_id, payload=payload_ml)
-
-    # 🔽 Persiste no seu banco
-    cn = db()
-    cur = cn.cursor()
-
-    cur.execute("""
-        MERGE dbo.ml_estoque_deposito AS t
-        USING (
-            SELECT ? AS empresa_id, ? AS seller_sku, ? AS store_id
-        ) s
-        ON t.empresa_id = s.empresa_id
-       AND t.seller_sku = s.seller_sku
-       AND t.store_id = s.store_id
-        WHEN MATCHED THEN UPDATE SET
-            quantidade = ?,
-            ultima_sincronizacao = SYSUTCDATETIME(),
-            atualizado_em = SYSUTCDATETIME()
-        WHEN NOT MATCHED THEN INSERT (
-            empresa_id,
-            seller_sku,
-            ml_user_product_id,
-            store_id,
-            quantidade,
-            ultima_sincronizacao,
-            criado_em,
-            atualizado_em
-        ) VALUES (
-            ?, ?, ?, ?, ?,
-            SYSUTCDATETIME(),
-            SYSUTCDATETIME(),
-            SYSUTCDATETIME()
-        );
-    """,
-        empresa_id, data.seller_sku, data.store_id,
-        int(data.quantidade),
-        empresa_id, data.seller_sku, data.ml_user_product_id, data.store_id, int(data.quantidade)
-    )
-
-    cn.commit()
-    cn.close()
-
-    return {
-        "ok": True,
-        "seller_sku": data.seller_sku,
-        "ml_user_product_id": data.ml_user_product_id,
-        "store_id": data.store_id,
-        "quantidade": int(data.quantidade),
-        "ml_response": ml_resp
-    }
 
 @app.get("/ml/estoque/cd/{seller_sku}")
 def ml_get_estoque_por_cd(
@@ -1921,42 +1851,46 @@ def worker_sync_anuncios(job_id: int, empresa_id: int):
             seller_sku, is_catalogo, tipo_anuncio = extract_ml_sku_and_tipo(it)
             logistic_type, is_full = extract_ml_logistica(it)
 
-            # 🔹 NOVO: user_product_id (ESSENCIAL PARA MULTI-CD)
+            # 🔹 NOVO: IDs essenciais para multi-CD / Inventory
             ml_user_product_id = it.get("user_product_id")
+            inventory_id = it.get("inventory_id")
+
 
             cur.execute("""
-                INSERT INTO dbo.ml_anuncios_cache (
-                    empresa_id,
-                    ml_item_id,
-                    ml_user_product_id,
-                    titulo,
-                    seller_sku,
-                    is_catalogo,
-                    tipo_anuncio,
-                    status,
-                    status_raw,
-                    preco,
-                    estoque_ml,
-                    logistic_type,
-                    is_full,
-                    atualizado_em
-                )
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
-            """,
-                empresa_id,
-                it.get("id"),
-                ml_user_product_id,              # ✅ NOVO
-                it.get("title"),
-                seller_sku,
-                int(is_catalogo),
-                tipo_anuncio,
-                status_pt(it.get("status")),
-                it.get("status"),
-                it.get("price"),
-                it.get("available_quantity"),
-                logistic_type,
-                1 if is_full else 0
-            )
+                    INSERT INTO dbo.ml_anuncios_cache (
+                        empresa_id,
+                        ml_item_id,
+                        ml_user_product_id,
+                        inventory_id,
+                        titulo,
+                        seller_sku,
+                        is_catalogo,
+                        tipo_anuncio,
+                        status,
+                        status_raw,
+                        preco,
+                        estoque_ml,
+                        logistic_type,
+                        is_full,
+                        atualizado_em
+                    )
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())
+                """,
+            empresa_id,
+            it.get("id"),
+            ml_user_product_id,              # ✅ já existia
+            inventory_id,                    # ✅ NOVO
+            it.get("title"),
+            seller_sku,
+            int(is_catalogo),
+            tipo_anuncio,
+            status_pt(it.get("status")),
+            it.get("status"),
+            it.get("price"),
+            it.get("available_quantity"),
+            logistic_type,
+            1 if is_full else 0
+        )
 
         cn.commit()
         cn.close()
@@ -2195,184 +2129,111 @@ def worker_bootstrap_estoque_cd(job_id: int, empresa_id: int):
 # ============================
 
 
-class AtualizarEstoqueCDPayload(BaseModel):
-    seller_sku: str
-    ml_user_product_id: str
-    store_id: str
-    quantidade: int
-
 
 @app.put("/ml/estoque/cd/update")
-def atualizar_estoque_cd(
-    payload: AtualizarEstoqueCDPayload,
-    auth=Depends(require_auth)
-):
-    empresa_id = int(auth["empresa_id"])
-
-    body = {
-        "locations": [
-            {
-                "store_id": payload.store_id,
-                "available_quantity": payload.quantidade
-            }
-        ]
-    }
-
-    resp = ml_put_empresa(
-        f"{ML_API}/user-products/{payload.ml_user_product_id}/stock",
-        empresa_id=empresa_id,
-        payload=body
-    )
-
-    return {
-        "ok": True,
-        "seller_sku": payload.seller_sku,
-        "ml_user_product_id": payload.ml_user_product_id,
-        "store_id": payload.store_id,
-        "quantidade": payload.quantidade,
-        "ml_response": resp
-    }
-
-
-
-def worker_ativar_cd_automatico(job_id: int, empresa_id: int):
-    job_set_processing(job_id)
-
-    cn = db()
-    cur = cn.cursor()
-
-    ativados = 0
-    ignorados = 0
-    erros = 0
-    processados = 0
-
-    try:
-        # 🔹 Produtos com user_product_id
-        cur.execute("""
-            SELECT DISTINCT
-                mac.seller_sku,
-                mac.ml_user_product_id
-            FROM dbo.ml_anuncios_cache mac
-            WHERE mac.empresa_id = ?
-              AND mac.ml_user_product_id IS NOT NULL
-        """, empresa_id)
-
-        produtos = cur.fetchall()
-
-        for p in produtos:
-            seller_sku = p.seller_sku
-            user_product_id = p.ml_user_product_id
-            processados += 1
-
-            try:
-                # 🔎 Consulta produto no ML
-                data = ml_get_empresa(
-                    f"{ML_API}/user-products/{user_product_id}/stock",
-                    empresa_id=empresa_id
-                )
-
-                locations = data.get("locations") or []
-
-                if locations:
-                    ignorados += 1
-                    continue
-
-
-                # 🔹 Ativa CD com quantidade 0
-                payload_ml = {
-                    "locations": [
-                        {
-                            "store_id": None,
-                            "available_quantity": 0
-                        }
-                    ]
-                }
-
-                ml_put_empresa(
-                    f"{ML_API}/user-products/{user_product_id}/stock",
-                    empresa_id=empresa_id,
-                    payload=payload_ml
-                )
-
-                ativados += 1
-
-            except Exception as e:
-                erros += 1
-                log(
-                    "ERRO",
-                    "Falha ao ativar CD automático",
-                    sku=seller_sku,
-                    user_product_id=user_product_id,
-                    erro=str(e)
-                )
-
-            # 🧠 RATE LIMIT SAFE (ML + Azure)
-            time.sleep(0.35)
-
-            # 🔄 Commit periódico (a cada 20)
-            if processados % 20 == 0:
-                cn.commit()
-
-        cn.commit()
-
-        job_set_success(job_id, {
-            "produtos_total": len(produtos),
-            "processados": processados,
-            "cd_ativados": ativados,
-            "ignorados": ignorados,
-            "erros": erros,
-            "sleep_por_item": 0.35
-        })
-
-    except Exception as e:
-        cn.rollback()
-        job_set_error(job_id, str(e))
-        raise
-
-    finally:
-        cn.close()
-
-
-
-@app.post("/ml/estoque/cd/ativar-automatico")
-def ativar_cd_automatico(
-    background_tasks: BackgroundTasks,
+def ml_update_estoque_cd(
+    data: EstoqueCDIn,
     payload=Depends(require_auth)
 ):
     empresa_id = int(payload["empresa_id"])
 
-    # 🔒 Só permite se multi-CD estiver ativo
+    if data.quantidade < 0:
+        raise HTTPException(status_code=400, detail="Quantidade inválida")
+
+    # ==========================================================
+    # 🔒 BLOQUEIO CORRETO:
+    # - NÃO bloqueia por ser FULL
+    # - bloqueia apenas se tentar escrever em store_id inválido
+    # - exige inventory_id (fonte de verdade do inventory endpoint)
+    # ==========================================================
+    if not data.inventory_id or not str(data.inventory_id).strip():
+        raise HTTPException(status_code=400, detail="inventory_id é obrigatório para atualizar estoque por CD.")
+
+    # (opcional, mas recomendado) valida se esse store_id existe na base de depósitos da empresa
     cn = db()
     cur = cn.cursor()
     cur.execute("""
-        SELECT warehouse_management
-        FROM dbo.ml_configuracao_conta
+        SELECT 1
+        FROM dbo.ml_depositos
         WHERE empresa_id = ?
-    """, empresa_id)
+          AND store_id = ?
+          AND status = 'active'
+    """, empresa_id, data.store_id)
 
-    cfg = cur.fetchone()
+    if not cur.fetchone():
+        cn.close()
+        raise HTTPException(status_code=400, detail="Depósito (store_id) inválido ou inativo para esta empresa.")
     cn.close()
 
-    if not cfg or int(cfg.warehouse_management) != 1:
-        raise HTTPException(
-            status_code=400,
-            detail="Conta não configurada para estoque multi-CD."
-        )
+    # ✅ ENDPOINT CORRETO DO INVENTORY (multi-CD)
+    url = f"{ML_API}/inventory/stock/items/{data.inventory_id}"
 
-    job_id = job_create("ATIVAR_CD_AUTOMATICO", empresa_id)
+    payload_ml = {
+        "locations": [
+            {
+                "store_id": data.store_id,
+                "quantity": int(data.quantidade)
+            }
+        ]
+    }
 
-    background_tasks.add_task(
-        worker_ativar_cd_automatico,
-        job_id,
-        empresa_id
+    # executa update no ML
+    ml_resp = ml_put_empresa(url, empresa_id=empresa_id, payload=payload_ml)
+
+    # ==========================================================
+    # 🔽 Persistência local (fonte local para UI)
+    # ==========================================================
+    cn = db()
+    cur = cn.cursor()
+
+    cur.execute("""
+        MERGE dbo.ml_estoque_deposito AS t
+        USING (
+            SELECT ? AS empresa_id, ? AS seller_sku, ? AS store_id
+        ) s
+        ON t.empresa_id = s.empresa_id
+       AND t.seller_sku = s.seller_sku
+       AND t.store_id = s.store_id
+        WHEN MATCHED THEN UPDATE SET
+            quantidade = ?,
+            ultima_sincronizacao = SYSUTCDATETIME(),
+            atualizado_em = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN INSERT (
+            empresa_id,
+            seller_sku,
+            ml_user_product_id,
+            inventory_id,
+            store_id,
+            quantidade,
+            ultima_sincronizacao,
+            criado_em,
+            atualizado_em
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?,
+            SYSUTCDATETIME(),
+            SYSUTCDATETIME(),
+            SYSUTCDATETIME()
+        );
+    """,
+        empresa_id, data.seller_sku, data.store_id,
+        int(data.quantidade),
+        empresa_id, data.seller_sku, (data.ml_user_product_id or None), data.inventory_id, data.store_id, int(data.quantidade)
     )
+
+    cn.commit()
+    cn.close()
 
     return {
         "ok": True,
-        "job_id": job_id,
-        "status": "PROCESSANDO",
-        "mensagem": "Ativação automática de CD iniciada."
+        "seller_sku": data.seller_sku,
+        "inventory_id": data.inventory_id,
+        "store_id": data.store_id,
+        "quantidade": int(data.quantidade),
+        "ml_resp": ml_resp
     }
+
+
+
 
 
 # ============================
@@ -2418,6 +2279,27 @@ def bootstrap_estoque_cd(
         "mensagem": "Bootstrap inicial de estoque por CD iniciado."
     }
 
+def baixar_estoque_cd_por_store_id(
+    cur,
+    empresa_id: int,
+    seller_sku: str,
+    store_id: str,
+    quantidade: int
+):
+    cur.execute("""
+        UPDATE dbo.ml_estoque_deposito
+        SET quantidade = CASE
+            WHEN quantidade >= ? THEN quantidade - ?
+            ELSE 0
+        END,
+        atualizado_em = SYSUTCDATETIME()
+        WHERE empresa_id = ?
+          AND seller_sku = ?
+          AND store_id = ?
+    """, quantidade, quantidade, empresa_id, seller_sku, store_id)
+
+    if cur.rowcount == 0:
+        raise Exception(f"Estoque não encontrado para SKU={seller_sku} no CD={store_id}")
 
 
 
@@ -3091,7 +2973,7 @@ def worker_processar_vendas_sync(job_id: int, empresa_id: int):
         dt_from = last_run - timedelta(minutes=int(JOB_LOOKBACK_MIN or 10))
 
     # =====================================================
-    # 🔒 TRAVA MULTI-CD: só baixa por CD se warehouse_management = 1
+    # 🔒 CONFIGURAÇÃO MULTI-CD
     # =====================================================
     cur.execute("""
         SELECT warehouse_management
@@ -3110,13 +2992,6 @@ def worker_processar_vendas_sync(job_id: int, empresa_id: int):
     for order in orders:
         order_id = str(order.get("id"))
 
-        # 🔎 CD de expedição (vem no pedido)
-        network_node_id = (
-            order.get("shipping", {})
-                 .get("receiver_address", {})
-                 .get("network_node_id")
-        )
-
         for oi in order.get("order_items", []) or []:
             ml_item_id = (oi.get("item") or {}).get("id")
             qty = int(oi.get("quantity") or 0)
@@ -3127,7 +3002,9 @@ def worker_processar_vendas_sync(job_id: int, empresa_id: int):
             if already_processed(cur, empresa_id, order_id, ml_item_id):
                 continue
 
-            # 🔎 Localiza SKU vinculado
+            # =====================================================
+            # 🔎 LOCALIZA SKU VINCULADO
+            # =====================================================
             cur.execute("""
                 SELECT s.codigo
                 FROM dbo.sku_anuncios sa
@@ -3141,26 +3018,65 @@ def worker_processar_vendas_sync(job_id: int, empresa_id: int):
 
             seller_sku = sku_row.codigo
 
-            # 🔻 BAIXA ESTOQUE POR CD (APENAS SE MULTI-CD)
-            if multi_cd and network_node_id:
+            # =====================================================
+            # 🔎 VERIFICA SE O ANÚNCIO É FULL
+            # =====================================================
+            cur.execute("""
+                SELECT is_full
+                FROM dbo.ml_anuncios_cache
+                WHERE empresa_id = ?
+                  AND ml_item_id = ?
+            """, empresa_id, ml_item_id)
+
+            row_full = cur.fetchone()
+            is_full = bool(row_full and row_full.is_full == 1)
+
+            # =====================================================
+            # 🔻 BAIXA ESTOQUE POR CD
+            # REGRA:
+            # - warehouse_management = 1
+            # - NÃO FULL
+            # =====================================================
+            if multi_cd and not is_full:
                 try:
-                    baixar_estoque_cd(
-                        cur=cur,
-                        empresa_id=empresa_id,
-                        seller_sku=seller_sku,
-                        network_node_id=network_node_id,
-                        quantidade=qty
-                    )
+                    # pega um CD ativo para esse SKU
+                    cur.execute("""
+                        SELECT TOP 1 store_id
+                        FROM dbo.ml_estoque_deposito
+                        WHERE empresa_id = ?
+                          AND seller_sku = ?
+                        ORDER BY store_id
+                    """, empresa_id, seller_sku)
+
+                    row_cd = cur.fetchone()
+
+                    if row_cd:
+                        baixar_estoque_cd_por_store_id(
+                            cur=cur,
+                            empresa_id=empresa_id,
+                            seller_sku=seller_sku,
+                            store_id=row_cd.store_id,
+                            quantidade=qty
+                        )
+                    else:
+                        log(
+                            "ERRO",
+                            "Multi-CD ativo, mas SKU sem CD cadastrado",
+                            sku=seller_sku,
+                            ml_item_id=ml_item_id
+                        )
+
                 except Exception as e:
                     log(
                         "ERRO",
                         "Falha ao baixar estoque por CD",
                         sku=seller_sku,
-                        network_node_id=network_node_id,
                         erro=str(e)
                     )
 
-            # ✔️ Marca venda como processada (mantém seu fluxo)
+            # =====================================================
+            # ✔️ MARCA VENDA COMO PROCESSADA
+            # =====================================================
             mark_processed(cur, empresa_id, order_id, ml_item_id, qty)
             processadas += 1
             unidades += qty
@@ -3179,8 +3095,9 @@ def worker_processar_vendas_sync(job_id: int, empresa_id: int):
 
 
 
+
 # ============================
-#ENDPOINT REPOSIÇÃO
+# ENDPOINT REPOSIÇÃO
 # ============================
 @app.get("/reposicao")
 def listar_reposicao(payload=Depends(require_auth)):
@@ -3190,32 +3107,55 @@ def listar_reposicao(payload=Depends(require_auth)):
     cur = cn.cursor()
 
     cur.execute("""
+        DECLARE @multi_cd BIT = 0;
+
+        -- 🔒 Verifica se a conta usa Multi-CD
+        SELECT @multi_cd = CASE
+            WHEN warehouse_management = 1 THEN 1
+            ELSE 0
+        END
+        FROM dbo.ml_configuracao_conta
+        WHERE empresa_id = ?;
+
         SELECT
           v.sku_id,
           v.sku_codigo,
           v.sku_nome,
 
-          -- 🔥 ESTOQUE REAL (MULTI-CD OU CENTRAL)
-          ISNULL((
-              SELECT SUM(e.quantidade)
-              FROM dbo.ml_estoque_deposito e
-              WHERE e.empresa_id = ?
-                AND e.seller_sku = v.sku_codigo
-          ), v.estoque_central) AS estoque_real,
+          -- 🔥 ESTOQUE REAL
+          CASE
+            WHEN @multi_cd = 1 THEN
+                ISNULL((
+                    SELECT SUM(e.quantidade)
+                    FROM dbo.ml_estoque_deposito e
+                    WHERE e.empresa_id = ?
+                      AND e.seller_sku = v.sku_codigo
+                ), 0)
+            ELSE
+                ISNULL(v.estoque_central, 0)
+          END AS estoque_real,
 
-          v.total_vendido,
+          ISNULL(v.total_vendido, 0) AS total_vendido,
 
           -- 🔥 SALDO REAL
-          ISNULL((
-              SELECT SUM(e.quantidade)
-              FROM dbo.ml_estoque_deposito e
-              WHERE e.empresa_id = ?
-                AND e.seller_sku = v.sku_codigo
-          ), v.estoque_central) - v.total_vendido AS saldo_real,
+          CASE
+            WHEN @multi_cd = 1 THEN
+                ISNULL((
+                    SELECT SUM(e.quantidade)
+                    FROM dbo.ml_estoque_deposito e
+                    WHERE e.empresa_id = ?
+                      AND e.seller_sku = v.sku_codigo
+                ), 0) - ISNULL(v.total_vendido, 0)
+            ELSE
+                ISNULL(v.estoque_central, 0) - ISNULL(v.total_vendido, 0)
+          END AS saldo_real,
 
-          v.estoque_minimo
+          ISNULL(v.estoque_minimo, 0) AS estoque_minimo
+
         FROM vw_sku_estoque v
+
         WHERE
+          -- SKUs com anúncios ML
           EXISTS (
             SELECT 1
             FROM dbo.sku_anuncios sa
@@ -3224,13 +3164,16 @@ def listar_reposicao(payload=Depends(require_auth)):
             WHERE sa.sku_id = v.sku_id
               AND mac.empresa_id = ?
           )
-        OR NOT EXISTS (
+
+          -- OU SKUs ainda sem anúncio (controle interno)
+          OR NOT EXISTS (
             SELECT 1
             FROM dbo.sku_anuncios sa2
             WHERE sa2.sku_id = v.sku_id
-        )
+          )
+
         ORDER BY saldo_real ASC;
-    """, empresa_id, empresa_id, empresa_id)
+    """, empresa_id, empresa_id, empresa_id, empresa_id)
 
     rows = cur.fetchall()
     cn.close()
@@ -3244,7 +3187,11 @@ def listar_reposicao(payload=Depends(require_auth)):
             "vendido": int(r.total_vendido or 0),
             "saldo": int(r.saldo_real or 0),
             "estoque_minimo": int(r.estoque_minimo or 0),
-            "status": "REPOR" if (r.saldo_real or 0) <= (r.estoque_minimo or 0) else "OK"
+            "status": (
+                "REPOR"
+                if (r.saldo_real or 0) <= (r.estoque_minimo or 0)
+                else "OK"
+            )
         }
         for r in rows
     ]
@@ -3255,6 +3202,7 @@ def listar_reposicao(payload=Depends(require_auth)):
         "meta": meta,
         "data": data
     }
+
 
 # ============================
 # SALVAR ESTOQUE MINIMO DA TELA DE REPOSIÇÃO
@@ -3612,6 +3560,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
