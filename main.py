@@ -983,7 +983,11 @@ def get_ml_token(empresa_id: int) -> str:
 
 def ml_headers_empresa(empresa_id: int) -> dict:
     token = get_ml_token(empresa_id)
-    return {"Authorization": f"Bearer {token}"}
+    # ✅ X-Version: obrigatório em alguns recursos (como estoque/warehouse)
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-Version": "2",
+    }
 
 
 def ml_get_empresa(url: str, empresa_id: int, params=None):
@@ -1001,21 +1005,15 @@ def ml_get_empresa(url: str, empresa_id: int, params=None):
 def ml_put_empresa(url: str, empresa_id: int, payload: dict):
     r = requests.put(
         url,
-        headers={
-            **ml_headers_empresa(empresa_id),
-            "Content-Type": "application/json",
-            "X-Version": "2"   # ✅ OBRIGATÓRIO PARA ESTOQUE / USER-PRODUCTS
-        },
+        headers={**ml_headers_empresa(empresa_id), "Content-Type": "application/json"},
         json=payload,
         timeout=30
     )
-
     if r.status_code >= 400:
         raise HTTPException(
             status_code=502,
             detail=f"Erro ML PUT: {r.status_code} - {r.text[:800]}"
         )
-
     return r.json()
 
 
@@ -1249,19 +1247,22 @@ def ml_update_estoque_cd(
     if data.quantidade < 0:
         raise HTTPException(status_code=400, detail="Quantidade inválida")
 
+    # ✅ Recurso correto para “Nos seus depósitos”
     url = f"{ML_API}/user-products/{data.ml_user_product_id}/stock/type/seller_warehouse"
 
+    # ✅ Body correto: quantity (não available_quantity)
     payload_ml = {
         "locations": [
             {
                 "store_id": data.store_id,
-                "quantity": data.quantidade
+                "quantity": int(data.quantidade)
             }
         ]
     }
 
-    ml_put_empresa(url, empresa_id=empresa_id, payload=payload_ml)
+    ml_resp = ml_put_empresa(url, empresa_id=empresa_id, payload=payload_ml)
 
+    # 🔽 Persiste no seu banco
     cn = db()
     cur = cn.cursor()
 
@@ -1284,20 +1285,18 @@ def ml_update_estoque_cd(
             store_id,
             quantidade,
             ultima_sincronizacao,
-            criado_em
+            criado_em,
+            atualizado_em
         ) VALUES (
-            ?, ?, ?, ?, ?, SYSUTCDATETIME(), SYSUTCDATETIME()
+            ?, ?, ?, ?, ?,
+            SYSUTCDATETIME(),
+            SYSUTCDATETIME(),
+            SYSUTCDATETIME()
         );
     """,
-        empresa_id,
-        data.seller_sku,
-        data.store_id,
-        data.quantidade,
-        empresa_id,
-        data.seller_sku,
-        data.ml_user_product_id,
-        data.store_id,
-        data.quantidade
+        empresa_id, data.seller_sku, data.store_id,
+        int(data.quantidade),
+        empresa_id, data.seller_sku, data.ml_user_product_id, data.store_id, int(data.quantidade)
     )
 
     cn.commit()
@@ -1305,11 +1304,12 @@ def ml_update_estoque_cd(
 
     return {
         "ok": True,
-        "sku": data.seller_sku,
+        "seller_sku": data.seller_sku,
+        "ml_user_product_id": data.ml_user_product_id,
         "store_id": data.store_id,
-        "quantidade": data.quantidade
+        "quantidade": int(data.quantidade),
+        "ml_response": ml_resp
     }
-
 
 @app.get("/ml/estoque/cd/{seller_sku}")
 def ml_get_estoque_por_cd(
