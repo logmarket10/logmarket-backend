@@ -810,15 +810,27 @@ def auto_vincular_sku_por_seller_sku(
 
 def ml_oauth_url(state: str) -> str:
     if not ML_CLIENT_ID or not ML_REDIRECT_URI:
-        raise HTTPException(status_code=500, detail="ML_CLIENT_ID / ML_REDIRECT_URI não configurados.")
+        raise HTTPException(
+            status_code=500,
+            detail="ML_CLIENT_ID / ML_REDIRECT_URI não configurados."
+        )
+
+    scope = (
+        "offline_access "
+        "read "
+        "write "
+        "read_inventory "
+        "write_inventory"
+    )
+
     return (
         f"{ML_OAUTH_AUTH}"
         f"?response_type=code"
         f"&client_id={ML_CLIENT_ID}"
         f"&redirect_uri={ML_REDIRECT_URI}"
+        f"&scope={scope}"
         f"&state={state}"
     )
-
 
 @app.get("/integracoes/mercadolivre/status")
 def ml_status(payload=Depends(require_auth)):
@@ -3532,6 +3544,7 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
+
 
 
 
