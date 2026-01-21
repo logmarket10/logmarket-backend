@@ -2051,6 +2051,8 @@ def worker_bootstrap_estoque_cd(job_id: int, empresa_id: int):
                     ignorados += 1
                     continue
 
+                inventory_id = user_product_id 
+                
                 cur.execute("""
                    INSERT INTO dbo.ml_estoque_deposito (
                         empresa_id,
@@ -2064,11 +2066,12 @@ def worker_bootstrap_estoque_cd(job_id: int, empresa_id: int):
                         criado_em,
                         atualizado_em
                     )
-                    VALUES ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME())
+                    VALUES (?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME())
                 """,
                     empresa_id,
                     seller_sku,
                     user_product_id,
+                    inventory_id,
                     store_id,
                     network_node_id,
                     qtd
@@ -3565,7 +3568,6 @@ def desvincular_anuncio(data: UnlinkItemIn, payload=Depends(require_auth)):
 
     cn.close()
     return {"ok": True}
-
 
 
 
