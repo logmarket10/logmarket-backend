@@ -934,6 +934,27 @@ def ml_callback(code: str, state: str):
     return RedirectResponse(url="https://orange-glacier-025d6730f.2.azurestaticapps.net/integracoes.html")
 
 
+@app.post("/integracoes/mercadolivre/disconnect")
+def ml_disconnect(payload=Depends(require_auth)):
+    empresa_id = int(payload["empresa_id"])
+
+    cn = db()
+    cur = cn.cursor()
+
+    # Remove COMPLETAMENTE o vínculo OAuth
+    cur.execute("""
+        DELETE FROM dbo.integracoes_mercadolivre
+        WHERE empresa_id = ?
+    """, empresa_id)
+
+    cn.commit()
+    cn.close()
+
+    return {
+        "ok": True,
+        "message": "Integração com Mercado Livre removida. Reautorize para continuar."
+    }
+
 # ---------- Token válido (refresh automático) ----------
 def get_ml_token(empresa_id: int) -> str:
     cn = db()
