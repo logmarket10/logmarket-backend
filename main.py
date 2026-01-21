@@ -1155,90 +1155,103 @@ def ml_fetch_paid_orders_since(dt_from: datetime, empresa_id: int, hard_limit=10
 class EstoqueCDIn(BaseModel):
     seller_sku: str
     ml_user_product_id: str | None = None
-    inventory_id: str
+    inventory_id: str | None = None  # Adicionado como opcional para evitar erros
     store_id: str
     quantidade: int
+    network_node_id: str | None = None
 
+class DepositoIn(BaseModel):
+    store_id: str
+    network_node_id: str
+    descricao: str
 
 
 @app.post("/ml/depositos/sync")
 def ml_sync_depositos(payload=Depends(require_auth)):
     empresa_id = int(payload["empresa_id"])
-
     me = ml_me(empresa_id)
     ml_user_id = me["id"]
 
+    # Busca as definições de depósitos/stores
     data = ml_get_empresa(
         f"{ML_API}/users/{ml_user_id}/stores/search",
         empresa_id=empresa_id,
         params={"tags": "stock_location"}
     )
-
     stores = data.get("results", [])
 
     cn = db()
     cur = cn.cursor()
+    try:
+        for s in stores:
+            cur.execute("""
+                MERGE dbo.ml_depositos AS t
+                USING (SELECT ? AS empresa_id, ? AS store_id) s
+                ON t.empresa_id = s.empresa_id AND t.store_id = s.store_id
+                WHEN MATCHED THEN UPDATE SET
+                    network_node_id = ?,
+                    descricao = ?,
+                    status = ?,
+                    atualizado_em = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN INSERT (
+                    empresa_id, store_id, network_node_id, descricao, status, criado_em
+                ) VALUES (?, ?, ?, ?, ?, SYSUTCDATETIME());
+            """, 
+            empresa_id, s["id"], 
+            s.get("network_node_id"), s.get("description"), s.get("status"),
+            empresa_id, s["id"], s.get("network_node_id"), s.get("description"), s.get("status")
+            )
+        cn.commit()
+        return {"status": "success", "count": len(stores)}
+    finally:
+        cn.close()
+@app.post("/ml/estoque-deposito/sync")
+def ml_sync_estoque_deposito(payload=Depends(require_auth)):
+    empresa_id = int(payload["empresa_id"])
+    
+    # Busca o estoque real via API V2 (essencial para trazer o inventory_id)
+    url_estoque = f"{ML_API}/inventories/stocks"
+    res_ml = ml_get_empresa(url_estoque, empresa_id=empresa_id)
+    itens_estoque = res_ml.get("results", [])
 
-    for s in stores:
-        cur.execute("""
-            MERGE dbo.ml_depositos AS t
-            USING (
-                SELECT ? AS empresa_id, ? AS store_id
-            ) s
-            ON t.empresa_id = s.empresa_id
-           AND t.store_id = s.store_id
-            WHEN MATCHED THEN UPDATE SET
-                network_node_id = ?,
-                descricao = ?,
-                status = ?,
-                endereco = ?,
-                cidade = ?,
-                estado = ?,
-                cep = ?,
-                atualizado_em = SYSUTCDATETIME()
-            WHEN NOT MATCHED THEN INSERT (
-                empresa_id,
-                store_id,
-                network_node_id,
-                descricao,
-                status,
-                endereco,
-                cidade,
-                estado,
-                cep,
-                criado_em
-            ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME()
-            );
-        """,
-            empresa_id,
-            s["id"],
-            s["network_node_id"],
-            s["description"],
-            s["status"],
-            s["location"]["address_line"],
-            s["location"]["city"],
-            s["location"]["state"],
-            s["location"]["zip_code"],
-            empresa_id,
-            s["id"],
-            s["network_node_id"],
-            s["description"],
-            s["status"],
-            s["location"]["address_line"],
-            s["location"]["city"],
-            s["location"]["state"],
-            s["location"]["zip_code"]
-        )
+    cn = db()
+    cur = cn.cursor()
+    try:
+        for item in itens_estoque:
+            # Captura o inventory_id que estava vindo NULL
+            inv_id = item.get("inventory_id")
+            sku = item.get("seller_sku")
+            st_id = item.get("store_id")
+            qtd = item.get("available_quantity", 0)
+            node_id = item.get("network_node_id")
 
-    cn.commit()
-    cn.close()
-
-    return {
-        "ok": True,
-        "depositos": len(stores)
-    }
-
+            cur.execute("""
+                MERGE dbo.ml_estoque_deposito AS t
+                USING (SELECT ? AS eid, ? AS sku, ? AS sid) s
+                ON t.empresa_id = s.eid AND t.seller_sku = s.sku AND t.store_id = s.sid
+                WHEN MATCHED THEN UPDATE SET
+                    quantidade = ?,
+                    inventory_id = ?,
+                    network_node_id = ?,
+                    ultima_sincronizacao = SYSUTCDATETIME(),
+                    atualizado_em = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN INSERT (
+                    empresa_id, seller_sku, store_id, quantidade, 
+                    inventory_id, network_node_id, 
+                    ultima_sincronizacao, criado_em, atualizado_em
+                ) VALUES (?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME());
+            """, 
+            empresa_id, sku, st_id,
+            qtd, inv_id, node_id,
+            empresa_id, sku, st_id, qtd, inv_id, node_id
+            )
+        cn.commit()
+        return {"ok": True, "sync_count": len(itens_estoque)}
+    except Exception as e:
+        cn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cn.close()
 
 
 @app.get("/ml/estoque/cd/{seller_sku}")
