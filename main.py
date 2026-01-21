@@ -2052,7 +2052,7 @@ def worker_bootstrap_estoque_cd(job_id: int, empresa_id: int):
                     continue
 
                 inventory_id = user_product_id 
-                
+
                 cur.execute("""
                    INSERT INTO dbo.ml_estoque_deposito (
                         empresa_id,
@@ -2112,44 +2112,15 @@ def ml_update_estoque_cd(
     if data.quantidade < 0:
         raise HTTPException(status_code=400, detail="Quantidade inválida")
 
-    # ==========================================================
-    # 🔎 BUSCA inventory_id + valida FULL (FONTE DA VERDADE)
-    # ==========================================================
+    if not data.inventory_id or not str(data.inventory_id).strip():
+        raise HTTPException(
+            status_code=400,
+            detail="inventory_id é obrigatório para atualizar estoque por CD."
+        )
+
+    # valida CD
     cn = db()
     cur = cn.cursor()
-
-    cur.execute("""
-        SELECT
-            inventory_id,
-            is_full,
-            ml_user_product_id
-        FROM dbo.ml_anuncios_cache
-        WHERE empresa_id = ?
-          AND seller_sku = ?
-    """, empresa_id, data.seller_sku)
-
-    row = cur.fetchone()
-
-    if not row or not row.inventory_id:
-        cn.close()
-        raise HTTPException(
-            status_code=400,
-            detail="inventory_id não encontrado para este SKU."
-        )
-
-    if int(row.is_full) == 1:
-        cn.close()
-        raise HTTPException(
-            status_code=400,
-            detail="Anúncio FULL não permite atualização de estoque por CD."
-        )
-
-    inventory_id = row.inventory_id
-    ml_user_product_id = row.ml_user_product_id
-
-    # ==========================================================
-    # 🔒 VALIDA DEPÓSITO (store_id)
-    # ==========================================================
     cur.execute("""
         SELECT 1
         FROM dbo.ml_depositos
@@ -2162,15 +2133,12 @@ def ml_update_estoque_cd(
         cn.close()
         raise HTTPException(
             status_code=400,
-            detail="Depósito (store_id) inválido ou inativo para esta empresa."
+            detail="Depósito (store_id) inválido ou inativo."
         )
-
     cn.close()
 
-    # ==========================================================
-    # 🚀 ATUALIZA ESTOQUE NO MERCADO LIVRE (MULTI-CD)
-    # ==========================================================
-    url = f"{ML_API}/inventory/stock/items/{inventory_id}"
+    # ✅ ENDPOINT CORRETO DO ML
+    url = f"{ML_API}/inventories/{data.inventory_id}/stock"
 
     payload_ml = {
         "locations": [
@@ -2181,15 +2149,9 @@ def ml_update_estoque_cd(
         ]
     }
 
-    ml_resp = ml_put_empresa(
-        url,
-        empresa_id=empresa_id,
-        payload=payload_ml
-    )
+    ml_resp = ml_put_empresa(url, empresa_id=empresa_id, payload=payload_ml)
 
-    # ==========================================================
-    # 💾 PERSISTÊNCIA LOCAL (UI / CONTROLE)
-    # ==========================================================
+    # persistência local
     cn = db()
     cur = cn.cursor()
 
@@ -2203,8 +2165,6 @@ def ml_update_estoque_cd(
        AND t.store_id = s.store_id
         WHEN MATCHED THEN UPDATE SET
             quantidade = ?,
-            inventory_id = ?,
-            ml_user_product_id = ?,
             ultima_sincronizacao = SYSUTCDATETIME(),
             atualizado_em = SYSUTCDATETIME()
         WHEN NOT MATCHED THEN INSERT (
@@ -2225,8 +2185,12 @@ def ml_update_estoque_cd(
         );
     """,
         empresa_id, data.seller_sku, data.store_id,
-        int(data.quantidade), inventory_id, ml_user_product_id,
-        empresa_id, data.seller_sku, ml_user_product_id, inventory_id, data.store_id, int(data.quantidade)
+        int(data.quantidade),
+        empresa_id, data.seller_sku,
+        data.ml_user_product_id,
+        data.inventory_id,
+        data.store_id,
+        int(data.quantidade)
     )
 
     cn.commit()
@@ -2235,7 +2199,7 @@ def ml_update_estoque_cd(
     return {
         "ok": True,
         "seller_sku": data.seller_sku,
-        "inventory_id": inventory_id,
+        "inventory_id": data.inventory_id,
         "store_id": data.store_id,
         "quantidade": int(data.quantidade),
         "ml_resp": ml_resp
